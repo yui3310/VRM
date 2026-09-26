@@ -100,6 +100,7 @@ namespace CCMediaPipe
                         var frame = ParseFrame(data);
                         if (frame != null)
                         {
+                            frame.receivedAtUtcMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
                             lock (frameLock) { latestFrame = frame; }
                         }
                     }

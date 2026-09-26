@@ -52,6 +52,34 @@ namespace CCMediaPipe
 
         public bool IsConnected => _isConnected;
 
+        /// <summary>Current webcam texture used as the detector input.</summary>
+        public Texture CameraTexture => _imageSource != null && _imageSource.isPrepared
+            ? _imageSource.GetCurrentTexture()
+            : null;
+
+        /// <summary>
+        /// Whether the detector input was horizontally flipped before inference.
+        /// The preview uses the same transform so landmarks stay aligned.
+        /// </summary>
+        public bool CameraFlipHorizontally
+        {
+            get
+            {
+                if (_imageSource == null || !_imageSource.isPrepared) return false;
+                return _imageSource.GetTransformationOptions().flipHorizontally;
+            }
+        }
+
+        /// <summary>Whether the detector input was vertically flipped before inference.</summary>
+        public bool CameraFlipVertically
+        {
+            get
+            {
+                if (_imageSource == null || !_imageSource.isPrepared) return false;
+                return _imageSource.GetTransformationOptions().flipVertically;
+            }
+        }
+
         private volatile bool _isConnected;
         private volatile bool _running;
 
@@ -226,7 +254,9 @@ namespace CCMediaPipe
                 minPoseDetectionConfidence: minPoseDetectionConfidence,
                 minPoseLandmarksConfidence: minPosePresenceConfidence,
                 minHandLandmarksConfidence: minHandLandmarksConfidence,
-                outputFaceBlendshapes: false,
+                // Blendshapes give per-eye blink scores (eyeBlinkLeft/Right) that
+                // are far more reliable for single-eye winks than geometric EAR.
+                outputFaceBlendshapes: true,
                 outputSegmentationMask: false,
                 resultCallback: resultCallback
             );
@@ -283,6 +313,7 @@ namespace CCMediaPipe
         private void OnHolisticDetectionOutput(in HolisticLandmarkerResult result, Image image, long timestamp)
         {
             var frame = ConvertResult(result, timestamp);
+            frame.receivedAtUtcMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             lock (_frameLock) { _latestFrame = frame; }
         }
 
@@ -314,6 +345,11 @@ namespace CCMediaPipe
             {
                 frame.faceLandmarks = ToArrayNormalized(faceNorm, HolisticFrame.FaceLandmarkCount);
             }
+
+            // ARKit-style face blendshapes (when enabled) carry dedicated
+            // eyeBlinkLeft / eyeBlinkRight scores. These read a single-eye wink
+            // correctly, unlike the symmetric face mesh used for EAR.
+            frame.faceBlendshapes = ToBlendshapeMap(result.faceBlendshapes);
 
             var leftHand = result.leftHandLandmarks.landmarks;
             if (HasCount(leftHand, HolisticFrame.HandLandmarkCount))
@@ -348,6 +384,24 @@ namespace CCMediaPipe
         }
 
         private static bool HasCount<T>(List<T> list, int count) => list != null && list.Count >= count;
+
+        private static Dictionary<string, float> ToBlendshapeMap(MpContainers.Classifications blendshapes)
+        {
+            var categories = blendshapes.categories;
+            if (categories == null || categories.Count == 0)
+                return null;
+
+            var map = new Dictionary<string, float>(categories.Count);
+            foreach (var category in categories)
+            {
+                // categoryName is the ARKit-style label (e.g. "eyeBlinkLeft").
+                // displayName is the fallback when no label map is present.
+                var name = category.categoryName ?? category.displayName;
+                if (string.IsNullOrEmpty(name)) continue;
+                map[name] = category.score;
+            }
+            return map.Count > 0 ? map : null;
+        }
 
         private static Landmark[] ToArrayNormalized(List<MpContainers.NormalizedLandmark> src, int count)
         {

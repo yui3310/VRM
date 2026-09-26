@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using UnityEngine;
 
 namespace CCMediaPipe
@@ -54,6 +55,14 @@ namespace CCMediaPipe
         public Landmark[] rightHandLandmarks;
 
         public long timestamp;
+        /// <summary>Local wall-clock time in milliseconds when the frame was received/produced.</summary>
+        public long receivedAtUtcMs;
+
+        // Optional ARKit-style face blendshape scores (0..1), keyed by the
+        // MediaPipe category name (e.g. "eyeBlinkLeft"). Populated only by the
+        // in-Unity MediaPipe detector when blendshape output is enabled; the UDP
+        // path leaves this null and falls back to geometric EAR blink detection.
+        public Dictionary<string, float> faceBlendshapes;
 
         public bool HasPoseWorld => poseWorldLandmarks != null && poseWorldLandmarks.Length == PoseLandmarkCount;
         public bool HasPoseNorm => poseLandmarks != null && poseLandmarks.Length == PoseLandmarkCount;
@@ -62,6 +71,57 @@ namespace CCMediaPipe
         public bool HasRightHandWorld => rightHandWorldLandmarks != null && rightHandWorldLandmarks.Length == HandLandmarkCount;
         public bool HasLeftHandNorm => leftHandLandmarks != null && leftHandLandmarks.Length == HandLandmarkCount;
         public bool HasRightHandNorm => rightHandLandmarks != null && rightHandLandmarks.Length == HandLandmarkCount;
+
+        /// <summary>True when ARKit-style face blendshape scores are available.</summary>
+        public bool HasFaceBlendshapes => faceBlendshapes != null && faceBlendshapes.Count > 0;
+
+        /// <summary>
+        /// Look up a face blendshape score by category name. Returns
+        /// <paramref name="fallback"/> when the score is not present.
+        /// </summary>
+        public float GetBlendshape(string name, float fallback = 0f)
+        {
+            if (faceBlendshapes != null && faceBlendshapes.TryGetValue(name, out var v))
+                return v;
+            return fallback;
+        }
+
+        public float GetConfidence(Landmark[] landmarks)
+        {
+            if (landmarks == null || landmarks.Length == 0)
+                return 0f;
+
+            float sum = 0f;
+            int count = 0;
+            for (int i = 0; i < landmarks.Length; i++)
+            {
+                sum += Mathf.Clamp01(landmarks[i].visibility);
+                count++;
+            }
+
+            return count > 0 ? sum / count : 0f;
+        }
+
+        public float PoseConfidence => GetConfidence(BestPoseLandmarks);
+        public float FaceConfidence => GetConfidence(faceLandmarks);
+        public float LeftHandConfidence => GetConfidence(BestLeftHand);
+        public float RightHandConfidence => GetConfidence(BestRightHand);
+
+        public float HandConfidence
+        {
+            get
+            {
+                bool hasLeft = BestLeftHand != null && BestLeftHand.Length > 0;
+                bool hasRight = BestRightHand != null && BestRightHand.Length > 0;
+                if (hasLeft && hasRight)
+                    return (LeftHandConfidence + RightHandConfidence) * 0.5f;
+                if (hasLeft)
+                    return LeftHandConfidence;
+                if (hasRight)
+                    return RightHandConfidence;
+                return 0f;
+            }
+        }
 
         /// <summary>Choose the best available pose data: world landmarks first, then normalized.</summary>
         public Landmark[] BestPoseLandmarks => HasPoseWorld ? poseWorldLandmarks : poseLandmarks;
