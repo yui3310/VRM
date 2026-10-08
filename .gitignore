@@ -1,4 +1,4 @@
-# Unity generated / runtime directories
+﻿# Unity generated / runtime directories
 /[Ll]ibrary/
 /[Tt]emp/
 /[Oo]bj/
@@ -21,6 +21,8 @@
 
 # Visual Studio, JetBrains and other IDE files
 .vs/
+.vscode/
+.idea/
 .gradle/
 .consulo/
 ExportedObj/
@@ -42,6 +44,7 @@ ExportedObj/
 *.pdb.meta
 *.mdb.meta
 *.DotSettings.user
+*.sln.iml
 /[Aa]ssets/Plugins/Editor/JetBrains*
 
 # Blender backup files
@@ -69,14 +72,39 @@ InitTestScene*.unity*
 /[Aa]ssets/Unity.VisualScripting.Generated/VisualScripting.Core/Property Providers
 /[Aa]ssets/Unity.VisualScripting.Generated/VisualScripting.Core/Property Providers.meta
 
+# TextMeshPro generated files
+/[Aa]ssets/TextMesh*Pro/
+
+# Unity Asset Store Tools
+/[Aa]ssets/AssetStoreTools*
+
 # OS generated files
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+ehthumbs_vista.db
 Thumbs.db
+Thumbs.db:encryptable
 Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+*.stackdump
+.AppleDouble
+.LSOverride
 
 # Python
 __pycache__/
 *.py[cod]
+*$py.class
+*.pyc
+*.pyo
+*.pyd
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
 
 # Project-specific
 Assets/vrm_convert/venv/

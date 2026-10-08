@@ -35,7 +35,7 @@ namespace CCMediaPipe
 
         [Header("WebCam")]
         [Tooltip("Preferred capture width; the closest available resolution is chosen.")]
-        public int preferredWebCamWidth = 1280;
+        public int preferredWebCamWidth = 640;
         [Tooltip("Index into the available webcam device list.")]
         public int webCamDeviceIndex = 0;
 
@@ -237,8 +237,8 @@ namespace CCMediaPipe
 
         private HolisticLandmarkerOptions BuildOptions(HolisticLandmarkerOptions.ResultCallback resultCallback)
         {
-            // Windows/macOS editors and standalone builds only ship the CPU
-            // delegate, matching the MediaPipe Unity sample behavior.
+            // Current MediaPipe Unity Plugin build does not support GPU delegate
+            // Using CPU with optimized settings for best performance
             var delegateType =
 #if UNITY_EDITOR_WIN || UNITY_STANDALONE_WIN || UNITY_EDITOR_OSX || UNITY_STANDALONE_OSX
                 BaseOptions.Delegate.CPU;

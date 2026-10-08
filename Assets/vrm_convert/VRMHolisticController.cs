@@ -37,7 +37,7 @@ namespace CCMediaPipe
         public bool invertY = true;
         [Tooltip("Invert MediaPipe Z to Unity Z.")]
         public bool invertZ = true;
-        [Tooltip("Scale factor for world landmarks â†’ Unity world units.")]
+        [Tooltip("Scale factor for world landmarks â†?Unity world units.")]
         public float landmarkScale = 1.0f;
 
         [Header("Smoothing")]
@@ -521,18 +521,38 @@ namespace CCMediaPipe
         }
 
         /// <summary>
-        /// Returns true while the mouse is over the runtime bone mapping panel.
+        /// <summary>
+        /// Returns true while the mouse is over any UI panel.
         /// ModelViewerCamera uses this to prevent IMGUI scroll input from
         /// leaking through to camera zoom.
         /// </summary>
         public bool IsPointerOverBoneMappingUI()
         {
-            if (!debugEnabled || !showRuntimeBoneMappingEditor || !runtimeBoneMappingExpanded)
-                return false;
-
             Vector3 mouse = Input.mousePosition;
             Vector2 guiPosition = new Vector2(mouse.x, Screen.height - mouse.y);
-            return GetBoneMappingEditorRect(MonitorWidth).Contains(guiPosition);
+
+            // Check Runtime Settings panel
+            if (GetSettingsPanelRect().Contains(guiPosition))
+                return true;
+
+            // Check AI Tracking panel
+            Rect aiTrackingRect = GetAITrackingRect(MonitorWidth, 204f);
+            if (aiTrackingRect.Contains(guiPosition))
+                return true;
+
+            // Check Bone Mapping Editor panel
+            if (GetBoneMappingEditorRect(MonitorWidth).Contains(guiPosition))
+                return true;
+
+            // Check Camera Preview panel
+            const float margin = 12f;
+            float x = margin;
+            float y = Mathf.Max(margin, Screen.height - CameraPreviewHeight - margin);
+            Rect cameraPreviewRect = new Rect(x, y, CameraPreviewWidth, CameraPreviewHeight);
+            if (cameraPreviewRect.Contains(guiPosition))
+                return true;
+
+            return false;
         }
 
         private Rect GetBoneMappingEditorRect(float width)
