@@ -1,4 +1,4 @@
-﻿# Unity generated / runtime directories
+# Unity generated / runtime directories
 /[Ll]ibrary/
 /[Tt]emp/
 /[Oo]bj/
@@ -106,6 +106,13 @@ __pycache__/
 pip-log.txt
 pip-delete-this-directory.txt
 
-# Project-specific
+# Project-specific: local Python environment
 Assets/vrm_convert/venv/
 Assets/vrm_convert/venv.meta
+
+# Local backup files
+*.backup
+*.backup.meta
+*.bak
+*.bak.meta
+*~

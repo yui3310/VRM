@@ -27,7 +27,7 @@ namespace CCMediaPipe
         [Tooltip("Current distance from the focus point along the view axis.")]
         public float distance = 2.5f;
         [Tooltip("Meters of zoom per scroll notch.")]
-        public float zoomSpeed = 0.5f;
+        public float zoomSpeed = 0.15f;
         public float minDistance = 0.3f;
         public float maxDistance = 10f;
         [Range(0f, 0.95f)]

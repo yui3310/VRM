@@ -35,7 +35,7 @@ namespace CCMediaPipe
 
         [Header("WebCam")]
         [Tooltip("Preferred capture width; the closest available resolution is chosen.")]
-        public int preferredWebCamWidth = 640;
+        public int preferredWebCamWidth = 1280;
         [Tooltip("Index into the available webcam device list.")]
         public int webCamDeviceIndex = 0;
 

@@ -1,0 +1,61 @@
+﻿<ui:UXML xmlns:ui="UnityEngine.UIElements" xmlns:uie="UnityEditor.UIElements"
+         xsi="http://www.w3.org/2001/XMLSchema-instance" engine="UnityEngine.UIElements" editor="UnityEditor.UIElements"
+         noNamespaceSchemaLocation="../../../UIElementsSchema/UIElements.xsd" editor-extension-mode="False">
+    <Style src="VRMModelSwitcherUI.uss"/>
+    
+    <ui:VisualElement name="panel-container" class="panel-container">
+        <ui:VisualElement name="header" class="header">
+            <ui:Label text="VRM Controller" class="header-title"/>
+            <ui:Button name="close-button" text="×" class="close-button"/>
+        </ui:VisualElement>
+        
+        <ui:VisualElement name="tabs" class="tabs-container">
+            <ui:Button name="tab-models" text="Models" class="tab tab-active"/>
+            <ui:Button name="tab-scenes" text="Scenes" class="tab"/>
+        </ui:VisualElement>
+        
+        <ui:VisualElement name="content" class="content-container">
+            <!-- Models Screen -->
+            <ui:VisualElement name="models-screen" class="screen">
+                <ui:VisualElement class="section">
+                    <ui:Label text="Models" class="section-header"/>
+                    <ui:Label name="models-count" text="0 models" class="count-label"/>
+                </ui:VisualElement>
+                
+                <ui:ScrollView name="models-scroll" class="scroll-view">
+                    <ui:VisualElement name="models-list" class="list-container"/>
+                </ui:ScrollView>
+                
+                <ui:VisualElement class="actions">
+                    <ui:Button name="load-model-button" text="+ Load Model" class="button-primary"/>
+                    <ui:Label text="Drop .vrm files here" class="hint-label"/>
+                </ui:VisualElement>
+                
+                <ui:VisualElement name="recording-section" class="section">
+                    <ui:Label text="Motion Capture" class="section-header"/>
+                    <ui:VisualElement class="recording-controls">
+                        <ui:Button name="record-button" text="● Record" class="button-secondary"/>
+                        <ui:Button name="stop-button" text="■ Stop" class="button-secondary"/>
+                    </ui:VisualElement>
+                </ui:VisualElement>
+            </ui:VisualElement>
+            
+            <!-- Scenes Screen -->
+            <ui:VisualElement name="scenes-screen" class="screen hidden">
+                <ui:VisualElement class="section">
+                    <ui:Label text="Scenes" class="section-header"/>
+                    <ui:Label name="scenes-count" text="0 scenes" class="count-label"/>
+                </ui:VisualElement>
+                
+                <ui:ScrollView name="scenes-scroll" class="scroll-view">
+                    <ui:VisualElement name="scenes-list" class="list-container"/>
+                </ui:ScrollView>
+                
+                <ui:VisualElement class="actions">
+                    <ui:Button name="load-scene-button" text="+ Load Scene" class="button-primary"/>
+                    <ui:Label text="Drop .glb/.gltf/.png/.jpg files here" class="hint-label"/>
+                </ui:VisualElement>
+            </ui:VisualElement>
+        </ui:VisualElement>
+    </ui:VisualElement>
+</ui:UXML>

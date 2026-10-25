@@ -37,7 +37,7 @@ namespace CCMediaPipe
         public bool invertY = true;
         [Tooltip("Invert MediaPipe Z to Unity Z.")]
         public bool invertZ = true;
-        [Tooltip("Scale factor for world landmarks â†?Unity world units.")]
+        [Tooltip("Scale factor for world landmarks ->Unity world units.")]
         public float landmarkScale = 1.0f;
 
         [Header("Smoothing")]
@@ -51,25 +51,40 @@ namespace CCMediaPipe
         [Header("Features")]
         [Tooltip("Drive VRM blend shapes from face landmarks (blink, etc.).")]
         public bool enableFaceBlendShapes = true;
-        [Range(1f, 3f)]
-        [Tooltip("Amplify MediaPipe blink input before it is sent to VRM expressions.")]
-        public float blinkStrength = 1.4f;
-        [Range(0.5f, 1f)]
-        [Tooltip("Blink values above this become fully closed after amplification.")]
-        public float blinkFullThreshold = 1f;
+        [Header("Blink Detection")]
+        [Tooltip("Each eye closes only when its closedness rises clearly above its own recent open baseline, so distance and jitter do not cause false blinks.")]
+        [Range(0f, 0.9f)] public float blinkSmoothing = 0.30f;
+        [Range(0.1f, 3f)] public float blinkBaselineRise = 1.5f;
+        [Range(1f, 20f)] public float blinkClosedPeakAttack = 10f;
+        [Range(0.1f, 5f)] public float blinkClosedPeakRelease = 1.5f;
+        [Range(0f, 0.2f)] public float blinkMinRange = 0.04f;
+        [Range(0.3f, 0.9f)] public float blinkCloseRatio = 0.55f;
+        [Range(0.1f, 0.7f)] public float blinkOpenRatio = 0.30f;
+        [Range(0f, 0.2f)] public float blinkConfirmSeconds = 0.03f;
+        [Range(0f, 0.2f)] public float blinkOpenConfirmSeconds = 0.05f;
+        [Tooltip("Re-measure the open-eye level every interval so a far/small face that reads as half-closed is treated as open; the eye only closes when it differs clearly from that level.")]
+        public bool blinkPeriodicCalibration = true;
+        [Range(0.5f, 10f)] public float blinkCalibrationInterval = 2f;
+
         [Range(0f, 1f)]
         [Tooltip("How much combined Blink is layered on top when both per-eye blinks are active.")]
         public float combinedBlinkLayer = 0f;
         [Tooltip("Drive hand finger bones.")]
         public bool enableHands = true;
-        [Tooltip("Keep hips, spine and legs in their rest pose so the avatar " +
-            "stays upright instead of leaning with the tracked torso. Arms, " +
-            "head and face still track.")]
-        public bool lockLowerBody = true;
+        [Tooltip("Keep hips and legs in their rest pose while the chest/spine " +
+            "still tracks from the shoulders. Use this for chest-up webcam crops.")]
+        public bool lockLowerBody = false;
         [Range(-45f, 45f)]
         [Tooltip("Extra head pitch in degrees. Increase if the mapped head sits " +
             "too low; positive lifts the head up.")]
         public float headPitchOffset = 0f;
+        [Range(-20f, 20f)]
+        [Tooltip("Fixed backward tilt applied to the Head bone. Increase this if the tracked head leans too far forward.")]
+        public float headPitchBackOffset = 6f;
+
+        [Range(-20f, 20f)]
+        [Tooltip("Fixed torso pitch correction. Positive tilts the chest/spine backward.")]
+        public float torsoPitchOffset = 2f;
         [Range(0f, 2f)]
         [Tooltip("How strongly head nodding (up/down pitch) is applied. 0 = no " +
             "nod (left/right only), 1 = full tracked nod.")]
@@ -80,18 +95,23 @@ namespace CCMediaPipe
         public List<HolisticToVRMBoneMapper.BoneMapping> boneMappings =
             HolisticToVRMBoneMapper.CreateDefaultBoneMappings();
         [Tooltip("Show an on-screen runtime editor for changing Humanoid bone mappings while playing.")]
-        public bool showRuntimeBoneMappingEditor = true;
+        public bool showRuntimeBoneMappingEditor = false;
         [Tooltip("Screen offset from the top-right corner for the runtime bone mapping editor (pixels).")]
         public Vector2 boneMappingEditorMargin = new Vector2(12f, 188f);
 
         [Header("Debug Skeleton")]
         [Tooltip("Draw the detected MediaPipe pose and hands over the VRM model.")]
-        public bool showDetectedSkeleton = true;
+        public bool showDetectedSkeleton = false;
         [Tooltip("Scale the debug skeleton to the model's approximate height so it fits the avatar size better.")]
         public bool autoScaleSkeletonToModel = true;
         [Range(0.5f, 2.5f)]
         [Tooltip("Fallback human height in meters used to convert the model's height into a display scale.")]
         public float skeletonHumanHeightReference = 1.70f;
+        [Tooltip("Align AI skeleton depth to the VRM humanoid bones instead of using raw MediaPipe depth.")]
+        public bool fitSkeletonDepthToModel = true;
+        [Range(0f, 1f)]
+        [Tooltip("0 keeps the raw AI depth, 1 fully matches the VRM bone depth.")]
+        public float skeletonDepthFitStrength = 1f;
         [Tooltip("Draw body pose landmarks in the debug skeleton.")]
         public bool showDetectedPose = true;
         [Tooltip("Draw hand landmarks in the debug skeleton.")]
@@ -121,6 +141,10 @@ namespace CCMediaPipe
         [Header("Camera Preview")]
         [Tooltip("Show the webcam image and 2D AI skeleton in the runtime settings UI.")]
         public bool showCameraPreview = true;
+        [Tooltip("Open the same webcam preview in a separate native Windows window. Standalone builds only.")]
+        public bool showCameraPreviewInSeparateWindow = false;
+        [Tooltip("Client size in pixels for the separate Windows preview window.")]
+        public Vector2Int externalPreviewWindowSize = new Vector2Int(640, 480);
         [Tooltip("Draw body pose landmarks over the camera preview.")]
         public bool previewShowPose = true;
         [Tooltip("Draw hand landmarks over the camera preview.")]
@@ -133,6 +157,9 @@ namespace CCMediaPipe
         public bool debugEnabled = true;
 
         private IMediaPipeReceiver receiver;
+#if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
+        private ExternalCameraPreviewWindow externalCameraPreviewWindow;
+#endif
         private HolisticToVRMBoneMapper mapper;
         private Animator animator;
         private Vrm10Instance vrm10Instance;
@@ -166,7 +193,11 @@ namespace CCMediaPipe
         private GUIStyle monitorRowStyle;
         private GUIStyle monitorRowActiveStyle;
         private GUIStyle monitorChipStyle;
+        private GUIStyle monitorLiveChipStyle;
+        private GUIStyle monitorPausedChipStyle;
         private Texture2D monitorBgTexture;
+        private GUISkin monitorScrollSkin;
+        private GUISkin scrollPreviousSkin;
         private bool monitorStylesReady;
         private Vector2 boneMappingScroll;
         private Vector2 settingsScroll;
@@ -175,12 +206,23 @@ namespace CCMediaPipe
         private bool settingsExpanded;
         private float settingsPanelHeight = SettingsExpandedHeight;
         private float boneMappingPanelHeight = 470f;
-        private float aiTrackingPanelHeight = 204f;
+        private const float AiTrackingPanelHeight = 250f;
         private int resizingRightPanel;
         private float resizeStartMouseY;
         private float resizeStartPanelHeight;
         private bool playbackOverride;
         private MotionCaptureRecorder motionRecorder;
+        public bool IsTrackingPaused { get; private set; } = true;
+
+        private bool runtimeUiOpen;
+        private Vector2 runtimeUiScroll;
+        private const float RuntimeUiRightMargin = 12f;
+        private const float RuntimeUiTopMargin = 12f;
+        private const float RuntimeUiPanelWidth = 380f;
+        private const float RuntimeUiPanelMaxHeight = 660f;
+        private const float TransportBarWidth = 350f;
+        private const float TransportBarHeight = 52f;
+        private const float UiGap = 8f;
 
         private const float MonitorWidth = 260f;
         private const float SettingsPanelWidth = 228f;
@@ -190,14 +232,17 @@ namespace CCMediaPipe
         private const float CameraPreviewWidth = 440f;
         private const float CameraPreviewHeight = 340f;
 
-        private static readonly Color UiBorder = new Color(1f, 1f, 1f, 0.07f);
-        private static readonly Color UiRow = new Color(1f, 1f, 1f, 0.04f);
-        private static readonly Color UiRowHover = new Color(1f, 1f, 1f, 0.10f);
-        private static readonly Color UiAccent = new Color(0.31f, 0.64f, 1f, 1f);
-        private static readonly Color UiAccentDim = new Color(0.31f, 0.64f, 1f, 0.18f);
-        private static readonly Color UiAccentHover = new Color(0.42f, 0.71f, 1f, 1f);
-        private static readonly Color UiText = new Color(0.92f, 0.93f, 0.96f, 1f);
-        private static readonly Color UiTextDim = new Color(0.60f, 0.63f, 0.70f, 1f);
+        private static readonly Color UiBorder = new Color(0.48f, 0.52f, 0.60f, 0.20f);
+        private static readonly Color UiRow = new Color(1f, 1f, 1f, 0.035f);
+        private static readonly Color UiRowHover = new Color(1f, 1f, 1f, 0.08f);
+        private static readonly Color UiAccent = new Color(0.18f, 0.76f, 0.64f, 1f);
+        private static readonly Color UiAccentDim = new Color(0.18f, 0.76f, 0.64f, 0.18f);
+        private static readonly Color UiAccentHover = new Color(0.29f, 0.87f, 0.74f, 1f);
+        private static readonly Color UiText = new Color(0.94f, 0.95f, 0.97f, 1f);
+        private static readonly Color UiTextDim = new Color(0.67f, 0.70f, 0.76f, 1f);
+        private static readonly Color UiGood = new Color(0.33f, 0.88f, 0.56f, 1f);
+        private static readonly Color UiWarn = new Color(1f, 0.76f, 0.28f, 1f);
+        private static readonly Color UiPoor = new Color(1f, 0.43f, 0.43f, 1f);
 
         /// <summary>Selects how landmark frames are produced.</summary>
         public enum DetectionSource
@@ -210,6 +255,7 @@ namespace CCMediaPipe
 
         private void Start()
         {
+            showCameraPreviewInSeparateWindow = false;
             motionRecorder = GetComponent<MotionCaptureRecorder>();
             if (motionRecorder == null)
                 motionRecorder = gameObject.AddComponent<MotionCaptureRecorder>();
@@ -218,6 +264,7 @@ namespace CCMediaPipe
             // once. Detection keeps producing frames even while no model is set.
             receiver = CreateReceiver();
             receiver.Start();
+            SyncExternalCameraPreviewWindow();
 
             if (vrmModel != null)
                 BindModel(vrmModel);
@@ -285,6 +332,19 @@ namespace CCMediaPipe
                 handSmoothing = this.handSmoothing,
                 lockLowerBody = this.lockLowerBody,
                 headPitchOffset = this.headPitchOffset,
+                headPitchBackOffset = this.headPitchBackOffset,
+                torsoPitchOffset = this.torsoPitchOffset,
+                blinkSmoothing = this.blinkSmoothing,
+                blinkBaselineRise = this.blinkBaselineRise,
+                blinkClosedPeakAttack = this.blinkClosedPeakAttack,
+                blinkClosedPeakRelease = this.blinkClosedPeakRelease,
+                blinkMinRange = this.blinkMinRange,
+                blinkCloseRatio = this.blinkCloseRatio,
+                blinkOpenRatio = this.blinkOpenRatio,
+                blinkConfirmSeconds = this.blinkConfirmSeconds,
+                blinkOpenConfirmSeconds = this.blinkOpenConfirmSeconds,
+                blinkPeriodicCalibration = this.blinkPeriodicCalibration,
+                blinkCalibrationInterval = this.blinkCalibrationInterval,
                 headPitchScale = this.headPitchScale,
             };
 
@@ -362,11 +422,54 @@ namespace CCMediaPipe
             }
         }
 
+        private void SyncExternalCameraPreviewWindow()
+        {
+#if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
+            bool shouldOpen = !Application.isEditor &&
+                showCameraPreviewInSeparateWindow &&
+                detectionSource == DetectionSource.UnityMediaPipe;
+
+            if (shouldOpen)
+            {
+                if (externalCameraPreviewWindow == null)
+                {
+                    externalCameraPreviewWindow = gameObject.AddComponent<ExternalCameraPreviewWindow>();
+                    externalCameraPreviewWindow.ClosedByUser += HandleExternalCameraPreviewClosedByUser;
+                }
+
+                externalCameraPreviewWindow.showPose = previewShowPose;
+                externalCameraPreviewWindow.showHands = previewShowHands;
+                externalCameraPreviewWindow.showFace = previewShowFace;
+                externalCameraPreviewWindow.SetDetector(receiver as MediaPipeHolisticDetector);
+
+                if (!externalCameraPreviewWindow.IsOpen)
+                {
+                    externalCameraPreviewWindow.windowWidth = Mathf.Max(1, externalPreviewWindowSize.x);
+                    externalCameraPreviewWindow.windowHeight = Mathf.Max(1, externalPreviewWindowSize.y);
+                    externalCameraPreviewWindow.Open();
+                }
+            }
+            else
+            {
+                externalCameraPreviewWindow?.Close();
+            }
+#endif
+        }
+
+        private void HandleExternalCameraPreviewClosedByUser()
+        {
+#if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
+            showCameraPreviewInSeparateWindow = false;
+            externalCameraPreviewWindow?.Close();
+#endif
+        }
+
         private void Update()
         {
             if (receiver == null) return;
 
             if (playbackOverride) return;
+            if (IsTrackingPaused) return;
 
             RefreshTrackingFrameAge();
 
@@ -382,6 +485,23 @@ namespace CCMediaPipe
         public void SetPlaybackOverride(bool enabled)
         {
             playbackOverride = enabled;
+        }
+
+        public void StartTracking()
+        {
+            IsTrackingPaused = false;
+        }
+
+        public void PauseTracking()
+        {
+            IsTrackingPaused = true;
+        }
+
+        public void ResetTrackingPose()
+        {
+            PauseTracking();
+            mapper?.ResetPose();
+            ResetExpressions();
         }
 
         public void ApplyExternalFrame(HolisticFrame frame)
@@ -406,6 +526,19 @@ namespace CCMediaPipe
                 // effect while playing.
                 mapper.lockLowerBody = lockLowerBody;
                 mapper.headPitchOffset = headPitchOffset;
+                mapper.headPitchBackOffset = headPitchBackOffset;
+                mapper.torsoPitchOffset = torsoPitchOffset;
+                mapper.blinkSmoothing = blinkSmoothing;
+                mapper.blinkBaselineRise = blinkBaselineRise;
+                mapper.blinkClosedPeakAttack = blinkClosedPeakAttack;
+                mapper.blinkClosedPeakRelease = blinkClosedPeakRelease;
+                mapper.blinkMinRange = blinkMinRange;
+                mapper.blinkCloseRatio = blinkCloseRatio;
+                mapper.blinkOpenRatio = blinkOpenRatio;
+                mapper.blinkConfirmSeconds = blinkConfirmSeconds;
+                mapper.blinkOpenConfirmSeconds = blinkOpenConfirmSeconds;
+                mapper.blinkPeriodicCalibration = blinkPeriodicCalibration;
+                mapper.blinkCalibrationInterval = blinkCalibrationInterval;
                 mapper.headPitchScale = headPitchScale;
 
                 mapper.ApplyBodyPose(frame);
@@ -421,32 +554,52 @@ namespace CCMediaPipe
             }
 
             UpdateSkeletonVisualizer(frame);
+
+#if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
+            if (externalCameraPreviewWindow != null)
+            {
+                externalCameraPreviewWindow.showPose = previewShowPose;
+                externalCameraPreviewWindow.showHands = previewShowHands;
+                externalCameraPreviewWindow.showFace = previewShowFace;
+                externalCameraPreviewWindow.SetOverlay(frame);
+            }
+#endif
         }
 
         private void OnGUI()
         {
             EnsureMonitorStyles();
 
-            if (debugEnabled && showAITrackingMonitor)
-                DrawAITrackingMonitor();
-            if (debugEnabled && showRuntimeBoneMappingEditor)
-                DrawRuntimeBoneMappingEditor();
-            if (showCameraPreview)
-                DrawCameraPreview();
-            DrawSettingsPanel();
+            DrawTransportBar();
+            if (runtimeUiOpen)
+                DrawRuntimeUIPanel();
         }
 
         private void DrawAITrackingMonitor()
         {
             float width = MonitorWidth;
-            float height = 204f;
+            float height = AiTrackingPanelHeight;
             Rect panelRect = GetAITrackingRect(width, height);
 
             GUILayout.BeginArea(panelRect, GUIContent.none, monitorPanelStyle);
             GUILayout.BeginHorizontal();
             GUILayout.Label("AI Tracking", monitorHeaderStyle);
             GUILayout.FlexibleSpace();
-            GUILayout.Label("LIVE", monitorChipStyle);
+            GUILayout.Label(IsTrackingPaused ? "PAUSED" : "LIVE", monitorChipStyle);
+            GUILayout.EndHorizontal();
+            GUILayout.Space(4f);
+            GUILayout.BeginHorizontal();
+            bool wasEnabled = GUI.enabled;
+            GUI.enabled = IsTrackingPaused;
+            if (GUILayout.Button("Start", monitorPrimaryButtonStyle, GUILayout.Height(26f)))
+                StartTracking();
+            GUI.enabled = !IsTrackingPaused;
+            if (GUILayout.Button("Pause", monitorSecondaryButtonStyle, GUILayout.Height(26f)))
+                PauseTracking();
+            GUI.enabled = true;
+            if (GUILayout.Button("Reset", monitorSecondaryButtonStyle, GUILayout.Height(26f)))
+                ResetTrackingPose();
+            GUI.enabled = wasEnabled;
             GUILayout.EndHorizontal();
             GUILayout.Space(4f);
             DrawConfidenceRow("Pose", trackingStats.poseConfidence);
@@ -461,6 +614,285 @@ namespace CCMediaPipe
                 : "--");
             DrawMetricRow("Expr", expressionStatus);
             GUILayout.EndArea();
+        }
+
+        private Rect GetTransportBarRect()
+        {
+            float x = Screen.width - RuntimeUiRightMargin - TransportBarWidth;
+            return new Rect(x, RuntimeUiTopMargin, TransportBarWidth, TransportBarHeight);
+        }
+
+        private Rect GetRuntimeUIPanelRect()
+        {
+            float x = Screen.width - RuntimeUiRightMargin - RuntimeUiPanelWidth;
+            float y = RuntimeUiTopMargin + TransportBarHeight + UiGap;
+            float available = Mathf.Max(180f, Screen.height - y - RuntimeUiTopMargin);
+            float height = Mathf.Min(RuntimeUiPanelMaxHeight, available);
+            return new Rect(x, y, RuntimeUiPanelWidth, height);
+        }
+
+        private void DrawTransportBar()
+        {
+            Rect rect = GetTransportBarRect();
+            GUILayout.BeginArea(rect, GUIContent.none, monitorPanelStyle);
+            GUILayout.BeginHorizontal();
+            bool wasEnabled = GUI.enabled;
+
+            GUILayout.Space(4f);
+            GUILayout.Label(IsTrackingPaused ? "PAUSED" : "LIVE",
+                IsTrackingPaused ? monitorPausedChipStyle : monitorLiveChipStyle,
+                GUILayout.Width(52f), GUILayout.Height(26f));
+            GUILayout.Space(4f);
+
+            GUI.enabled = IsTrackingPaused;
+            if (GUILayout.Button("Start", monitorPrimaryButtonStyle, GUILayout.Width(52f), GUILayout.Height(26f)))
+                StartTracking();
+
+            GUI.enabled = !IsTrackingPaused;
+            if (GUILayout.Button("Pause", monitorSecondaryButtonStyle, GUILayout.Width(52f), GUILayout.Height(26f)))
+                PauseTracking();
+
+            GUI.enabled = true;
+            if (GUILayout.Button("Reset", monitorSecondaryButtonStyle, GUILayout.Width(52f), GUILayout.Height(26f)))
+                ResetTrackingPose();
+
+            GUILayout.Space(6f);
+            if (GUILayout.Button("Settings", monitorSecondaryButtonStyle, GUILayout.Width(70f), GUILayout.Height(26f)))
+                runtimeUiOpen = !runtimeUiOpen;
+
+            GUI.enabled = wasEnabled;
+            GUILayout.EndHorizontal();
+            GUILayout.EndArea();
+        }
+
+        private void DrawRuntimeUIPanel()
+        {
+            Rect panelRect = GetRuntimeUIPanelRect();
+            GUILayout.BeginArea(panelRect, GUIContent.none, monitorPanelStyle);
+
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("Runtime Settings", monitorHeaderStyle);
+            GUILayout.FlexibleSpace();
+            if (GUILayout.Button("Close", monitorMiniButtonStyle, GUILayout.Width(52f), GUILayout.Height(24f)))
+                runtimeUiOpen = false;
+            GUILayout.EndHorizontal();
+            GUILayout.Space(6f);
+
+            float contentHeight = Mathf.Max(48f, panelRect.height - 46f);
+            runtimeUiScroll = BeginMonitorScroll(runtimeUiScroll, contentHeight);
+
+            if (debugEnabled && showAITrackingMonitor)
+                DrawRuntimeTrackingSection();
+
+            DrawRuntimeSettingsSection();
+
+            if (Application.isEditor && showCameraPreview)
+                DrawCameraPreviewSection();
+
+            if (debugEnabled && showRuntimeBoneMappingEditor)
+                DrawBoneMappingSection();
+
+            EndMonitorScroll();
+            GUILayout.EndArea();
+        }
+
+        private void DrawSectionHeader(string title)
+        {
+            GUILayout.Space(6f);
+            GUILayout.Label(title, monitorSubHeaderStyle);
+            Rect line = GUILayoutUtility.GetRect(0f, 1f, GUILayout.ExpandWidth(true));
+            Color old = GUI.color;
+            GUI.color = UiBorder;
+            GUI.DrawTexture(line, Texture2D.whiteTexture);
+            GUI.color = old;
+            GUILayout.Space(4f);
+        }
+
+        private void DrawRuntimeTrackingSection()
+        {
+            DrawSectionHeader("Tracking");
+            DrawConfidenceRow("Pose", trackingStats.poseConfidence);
+            DrawConfidenceRow("Face", trackingStats.faceConfidence);
+            DrawConfidenceRow("Hand", trackingStats.handConfidence);
+            DrawMetricRow("FPS", trackingStats.actualFps > 0f ? trackingStats.actualFps.ToString("0.0") : "--");
+            DrawMetricRow("Dropped", trackingStats.droppedFrames.ToString());
+            DrawMetricRow("Latency", trackingStats.latencyMs >= 0f ? trackingStats.latencyMs.ToString("0") + " ms" : "--");
+            DrawMetricRow("Last frame", trackingStats.lastFrameAgeMs >= 0f ? trackingStats.lastFrameAgeMs.ToString("0") + " ms" : "--");
+            DrawMetricRow("Blend", latestFrame != null && latestFrame.HasFaceBlendshapes
+                ? latestFrame.faceBlendshapes.Count.ToString()
+                : "--");
+            DrawMetricRow("Expr", expressionStatus);
+        }
+
+        private void DrawRuntimeSettingsSection()
+        {
+            DrawSectionHeader("Settings");
+
+            GUILayout.Label(debugEnabled ? "Tracking overlays are active" : "Tracking overlays are hidden", monitorTinyStyle);
+            GUILayout.Space(4f);
+
+            bool nextDebugEnabled = DrawSettingsToggle(debugEnabled, "Debug Overlays", "Tracking monitor and mapping tools");
+            if (nextDebugEnabled != debugEnabled)
+                SetDebugEnabled(nextDebugEnabled);
+
+            bool fullBodyEnabled = DrawSettingsToggle(
+                !lockLowerBody, "Full Body", "Hips, spine and legs follow tracking");
+            bool previousLockLowerBody = lockLowerBody;
+            lockLowerBody = !fullBodyEnabled;
+            if (mapper != null)
+                mapper.lockLowerBody = lockLowerBody;
+            if (lockLowerBody && !previousLockLowerBody)
+                mapper?.ResetLowerBodyPose();
+
+            blinkPeriodicCalibration = DrawSettingsToggle(
+                blinkPeriodicCalibration, "Blink Calibration",
+                "Re-check open eyes every " + blinkCalibrationInterval.ToString("0.#") + "s");
+
+            showDetectedSkeleton = DrawSettingsToggle(
+                showDetectedSkeleton, "Model Skeleton", "AI skeleton over the avatar");
+
+            showAITrackingMonitor = DrawSettingsToggle(
+                showAITrackingMonitor, "Tracking Monitor", "Confidence and frame stats");
+            showRuntimeBoneMappingEditor = DrawSettingsToggle(
+                showRuntimeBoneMappingEditor, "Bone Mapping", "Edit bone targets at runtime");
+
+#if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
+            bool showPreviewLayers;
+            if (Application.isEditor)
+            {
+                bool nextPreview = DrawSettingsToggle(
+                    showCameraPreview, "Camera Preview", "Live camera image and landmarks");
+                if (nextPreview != showCameraPreview)
+                    showCameraPreview = nextPreview;
+                showPreviewLayers = showCameraPreview;
+            }
+            else
+            {
+                bool nextExternalPreview = DrawSettingsToggle(
+                    showCameraPreviewInSeparateWindow, "Camera Preview", "Camera preview in a native Windows window");
+                if (nextExternalPreview != showCameraPreviewInSeparateWindow)
+                {
+                    showCameraPreviewInSeparateWindow = nextExternalPreview;
+                    SyncExternalCameraPreviewWindow();
+                }
+                showPreviewLayers = showCameraPreviewInSeparateWindow;
+            }
+#else
+            bool nextPreview = DrawSettingsToggle(
+                showCameraPreview, "Camera Preview", "Live camera image and landmarks");
+            if (nextPreview != showCameraPreview)
+                showCameraPreview = nextPreview;
+            bool showPreviewLayers = showCameraPreview;
+#endif
+
+            if (showPreviewLayers)
+            {
+                GUILayout.Space(3f);
+                GUILayout.Label("Preview Layers", monitorSubHeaderStyle);
+                previewShowPose = DrawSettingsToggle(previewShowPose, "Pose", "Body landmarks");
+                previewShowHands = DrawSettingsToggle(previewShowHands, "Hands", "Hand landmarks");
+                previewShowFace = DrawSettingsToggle(previewShowFace, "Face", "Face landmarks");
+                SyncExternalCameraPreviewWindow();
+            }
+        }
+
+        private void DrawCameraPreviewSection()
+        {
+            DrawSectionHeader("Camera Preview");
+
+            var detector = receiver as MediaPipeHolisticDetector;
+            Texture texture = detector != null ? detector.CameraTexture : null;
+            float contentWidth = RuntimeUiPanelWidth - 34f;
+            Rect content = GUILayoutUtility.GetRect(contentWidth, 200f, GUILayout.ExpandWidth(false));
+
+            if (texture == null)
+            {
+                GUI.color = new Color(1f, 1f, 1f, 0.12f);
+                GUI.DrawTexture(content, Texture2D.whiteTexture);
+                GUI.color = Color.white;
+                GUI.Label(content, detector == null
+                    ? "Preview requires UnityMediaPipe source"
+                    : "Waiting for camera...", monitorLabelStyle);
+                return;
+            }
+
+            float aspect = texture.height > 0f ? (float)texture.width / texture.height : 4f / 3f;
+            Rect imageRect = FitRect(content, aspect);
+            Rect uv = new Rect(
+                detector.CameraFlipHorizontally ? 1f : 0f,
+                0f,
+                detector.CameraFlipHorizontally ? -1f : 1f,
+                1f);
+
+            GUI.DrawTextureWithTexCoords(imageRect, texture, uv);
+            DrawPreviewSkeleton(imageRect, uv);
+
+            if (latestFrame != null)
+            {
+                string blend = latestFrame.HasFaceBlendshapes
+                    ? "Blendshape " + latestFrame.faceBlendshapes.Count
+                    : "Blendshape unavailable";
+                GUI.Label(new Rect(imageRect.x + 8f, imageRect.y + 8f, imageRect.width - 16f, 22f),
+                    blend + " | " + expressionStatus, monitorTinyStyle);
+            }
+        }
+
+        private void DrawBoneMappingSection()
+        {
+            EnsureBoneMappingEnumCache();
+            EnsureBoneMappings();
+
+            GUILayout.Space(6f);
+            GUILayout.BeginHorizontal();
+            if (GUILayout.Button(runtimeBoneMappingExpanded ? "v" : ">", monitorMiniButtonStyle,
+                    GUILayout.Width(24f), GUILayout.Height(22f)))
+            {
+                runtimeBoneMappingExpanded = !runtimeBoneMappingExpanded;
+            }
+            GUILayout.Label("Bone Mapping", monitorSubHeaderStyle);
+            GUILayout.EndHorizontal();
+            Rect line = GUILayoutUtility.GetRect(0f, 1f, GUILayout.ExpandWidth(true));
+            Color old = GUI.color;
+            GUI.color = UiBorder;
+            GUI.DrawTexture(line, Texture2D.whiteTexture);
+            GUI.color = old;
+            GUILayout.Space(4f);
+
+            if (!runtimeBoneMappingExpanded)
+            {
+                return;
+            }
+
+            GUILayout.Label("Change a target and it applies immediately.", monitorTinyStyle);
+            GUILayout.Space(4f);
+
+            for (int i = 0; i < boneMappings.Count; i++)
+            {
+                var mapping = boneMappings[i];
+                GUILayout.BeginHorizontal(monitorRowStyle);
+                GUILayout.Label(mapping.role.ToString(), monitorLabelStyle, GUILayout.Width(92f));
+
+                if (GUILayout.Button("<", monitorMiniButtonStyle, GUILayout.Width(22f), GUILayout.Height(24f)))
+                    CycleBoneMapping(i, -1);
+                GUILayout.Label(mapping.target.ToString(), monitorValueStyle, GUILayout.Width(86f));
+                if (GUILayout.Button(">", monitorMiniButtonStyle, GUILayout.Width(22f), GUILayout.Height(24f)))
+                    CycleBoneMapping(i, 1);
+                if (GUILayout.Button("Disable", monitorSecondaryButtonStyle, GUILayout.Width(64f), GUILayout.Height(24f)))
+                    SetBoneMappingTarget(i, HumanBodyBones.LastBone);
+
+                GUILayout.EndHorizontal();
+                GUILayout.Space(2f);
+            }
+
+            GUILayout.BeginHorizontal();
+            if (GUILayout.Button("Reset Defaults", monitorSecondaryButtonStyle, GUILayout.Height(26f)))
+                ResetBoneMappingsToDefault();
+            if (GUILayout.Button("Apply", monitorPrimaryButtonStyle, GUILayout.Height(26f)))
+            {
+                EnsureBoneMappings();
+                ApplyBoneMappingsToMapper();
+            }
+            GUILayout.EndHorizontal();
         }
 
         private void DrawRuntimeBoneMappingEditor()
@@ -488,8 +920,7 @@ namespace CCMediaPipe
             GUILayout.Label("Change a target and it applies immediately.", monitorLabelStyle);
 
             float scrollHeight = Mathf.Max(60f, panelRect.height - 105f);
-            boneMappingScroll = GUILayout.BeginScrollView(
-                boneMappingScroll, false, true, GUILayout.Height(scrollHeight));
+            boneMappingScroll = BeginMonitorScroll(boneMappingScroll, scrollHeight);
             for (int i = 0; i < boneMappings.Count; i++)
             {
                 var mapping = boneMappings[i];
@@ -506,7 +937,7 @@ namespace CCMediaPipe
                 GUILayout.EndHorizontal();
                 GUILayout.Space(2f);
             }
-            GUILayout.EndScrollView();
+            EndMonitorScroll();
 
             GUILayout.BeginHorizontal();
             if (GUILayout.Button("Reset Defaults", monitorSecondaryButtonStyle, GUILayout.Height(26f)))
@@ -531,25 +962,9 @@ namespace CCMediaPipe
             Vector3 mouse = Input.mousePosition;
             Vector2 guiPosition = new Vector2(mouse.x, Screen.height - mouse.y);
 
-            // Check Runtime Settings panel
-            if (GetSettingsPanelRect().Contains(guiPosition))
+            if (GetTransportBarRect().Contains(guiPosition))
                 return true;
-
-            // Check AI Tracking panel
-            Rect aiTrackingRect = GetAITrackingRect(MonitorWidth, 204f);
-            if (aiTrackingRect.Contains(guiPosition))
-                return true;
-
-            // Check Bone Mapping Editor panel
-            if (GetBoneMappingEditorRect(MonitorWidth).Contains(guiPosition))
-                return true;
-
-            // Check Camera Preview panel
-            const float margin = 12f;
-            float x = margin;
-            float y = Mathf.Max(margin, Screen.height - CameraPreviewHeight - margin);
-            Rect cameraPreviewRect = new Rect(x, y, CameraPreviewWidth, CameraPreviewHeight);
-            if (cameraPreviewRect.Contains(guiPosition))
+            if (runtimeUiOpen && GetRuntimeUIPanelRect().Contains(guiPosition))
                 return true;
 
             return false;
@@ -562,7 +977,7 @@ namespace CCMediaPipe
             Rect settingsRect = GetSettingsPanelRect();
             float x = Mathf.Max(0f, Screen.width - width - aiMonitorMargin.x);
             float bottom = settingsRect.y - RightPanelGap;
-            float minimumTop = Mathf.Max(0f, aiMonitorMargin.y + 204f + RightPanelGap);
+            float minimumTop = Mathf.Max(0f, aiMonitorMargin.y + AiTrackingPanelHeight + RightPanelGap);
             float availableHeight = bottom - minimumTop;
             float height = runtimeBoneMappingExpanded
                 ? Mathf.Clamp(availableHeight, collapsedHeight, expandedHeight)
@@ -599,8 +1014,7 @@ namespace CCMediaPipe
             if (settingsExpanded)
             {
                 float contentHeight = Mathf.Max(48f, panelRect.height - 38f);
-                settingsScroll = GUILayout.BeginScrollView(
-                    settingsScroll, false, true, GUILayout.Height(contentHeight));
+                settingsScroll = BeginMonitorScroll(settingsScroll, contentHeight);
 
                 GUILayout.Space(4f);
                 GUILayout.Label(debugEnabled ? "Tracking overlays are active" : "Tracking overlays are hidden", monitorTinyStyle);
@@ -614,6 +1028,8 @@ namespace CCMediaPipe
                     !lockLowerBody, "Full Body", "Hips, spine and legs follow tracking");
                 bool previousLockLowerBody = lockLowerBody;
                 lockLowerBody = !fullBodyEnabled;
+                if (mapper != null)
+                    mapper.lockLowerBody = lockLowerBody;
                 if (lockLowerBody && !previousLockLowerBody)
                     mapper?.ResetLowerBodyPose();
 
@@ -634,7 +1050,7 @@ namespace CCMediaPipe
                     previewShowFace = DrawSettingsToggle(previewShowFace, "Face", "Face landmarks");
                 }
 
-                GUILayout.EndScrollView();
+                EndMonitorScroll();
             }
             GUILayout.EndArea();
         }
@@ -662,7 +1078,7 @@ namespace CCMediaPipe
                 // Keep enough room for the other right-column panels. The
                 // settings content may become shorter on very small windows,
                 // but panels must never be drawn on top of one another.
-                float reserved = aiMonitorMargin.y + 204f +
+                float reserved = aiMonitorMargin.y + AiTrackingPanelHeight +
                     RightPanelGap * 3f + 42f;
                 height = Mathf.Min(height, Mathf.Max(SettingsCollapsedHeight,
                     Screen.height - 12f - reserved));
@@ -922,6 +1338,7 @@ namespace CCMediaPipe
 
             Transform hips = animator != null ? animator.GetBoneTransform(HumanBodyBones.Hips) : null;
             Transform anchor = hips != null ? hips : vrmModel.transform;
+            skeletonVisualizer.SetModelAnimator(animator);
             skeletonVisualizer.Configure(anchor, Vector3.zero, mirrorX, invertY, invertZ, GetSkeletonDisplayScale());
         }
 
@@ -937,6 +1354,9 @@ namespace CCMediaPipe
             skeletonVisualizer.jointRadius = skeletonJointRadius;
             skeletonVisualizer.lineWidth = skeletonLineWidth;
             skeletonVisualizer.alpha = skeletonAlpha;
+            skeletonVisualizer.fitDepthToModel = fitSkeletonDepthToModel;
+            skeletonVisualizer.depthFitStrength = skeletonDepthFitStrength;
+            skeletonVisualizer.SetModelAnimator(animator);
             skeletonVisualizer.Configure(
                 animator != null ? animator.GetBoneTransform(HumanBodyBones.Hips) : vrmModel.transform,
                 Vector3.zero,
@@ -1037,7 +1457,7 @@ namespace CCMediaPipe
             if (monitorStylesReady)
                 return;
 
-            monitorBgTexture = RoundedRect(24, 9, new Color(0.09f, 0.10f, 0.13f, 0.96f), UiBorder);
+            monitorBgTexture = RoundedRect(24, 9, new Color(0.06f, 0.065f, 0.075f, 0.97f), UiBorder);
             monitorPanelStyle = new GUIStyle(GUI.skin.box)
             {
                 border = new RectOffset(9, 9, 9, 9),
@@ -1054,13 +1474,14 @@ namespace CCMediaPipe
             Texture2D secondaryHoverBg = RoundedRect(24, 9, new Color(1f, 1f, 1f, 0.13f));
             monitorHeaderStyle = new GUIStyle(GUI.skin.label)
             {
-                fontSize = 14,
+                fontSize = 16,
                 fontStyle = FontStyle.Bold,
                 normal = { textColor = UiText },
             };
             monitorLabelStyle = new GUIStyle(GUI.skin.label)
             {
-                fontSize = 12,
+                fontSize = 13,
+                fontStyle = FontStyle.Bold,
                 normal = { textColor = UiTextDim },
             };
             monitorValueStyle = new GUIStyle(monitorLabelStyle)
@@ -1068,12 +1489,14 @@ namespace CCMediaPipe
                 alignment = TextAnchor.MiddleRight,
                 normal = { textColor = UiText },
             };
-            monitorGoodStyle = new GUIStyle(monitorValueStyle) { normal = { textColor = new Color(0.44f, 0.95f, 0.60f, 1f) } };
-            monitorWarnStyle = new GUIStyle(monitorValueStyle) { normal = { textColor = new Color(1f, 0.76f, 0.26f, 1f) } };
-            monitorPoorStyle = new GUIStyle(monitorValueStyle) { normal = { textColor = new Color(1f, 0.40f, 0.40f, 1f) } };
+            monitorGoodStyle = new GUIStyle(monitorValueStyle) { normal = { textColor = UiGood } };
+            monitorWarnStyle = new GUIStyle(monitorValueStyle) { normal = { textColor = UiWarn } };
+            monitorPoorStyle = new GUIStyle(monitorValueStyle) { normal = { textColor = UiPoor } };
             monitorButtonStyle = new GUIStyle(GUI.skin.button)
             {
-                fontSize = 11,
+                fontSize = 13,
+                fontStyle = FontStyle.Bold,
+                margin = new RectOffset(2, 2, 2, 2),
                 normal = { textColor = UiText },
             };
             monitorButtonStyle.normal.background = secondaryBg;
@@ -1081,12 +1504,12 @@ namespace CCMediaPipe
             monitorButtonStyle.active.background = secondaryBg;
             monitorMiniButtonStyle = new GUIStyle(monitorButtonStyle)
             {
-                fontSize = 12,
+                fontSize = 13,
                 fontStyle = FontStyle.Bold,
             };
             monitorPrimaryButtonStyle = new GUIStyle(monitorButtonStyle)
             {
-                fontSize = 12,
+                fontSize = 13,
                 fontStyle = FontStyle.Bold,
             };
             monitorPrimaryButtonStyle.normal.background = primaryBg;
@@ -1097,13 +1520,13 @@ namespace CCMediaPipe
             monitorPrimaryButtonStyle.active.textColor = new Color(0.04f, 0.08f, 0.15f, 1f);
             monitorSecondaryButtonStyle = new GUIStyle(monitorButtonStyle)
             {
-                fontSize = 11,
+                fontSize = 12,
                 fontStyle = FontStyle.Bold,
             };
             monitorToggleStyle = new GUIStyle(GUI.skin.toggle)
             {
                 alignment = TextAnchor.MiddleCenter,
-                fontSize = 10,
+                fontSize = 11,
                 fontStyle = FontStyle.Bold,
                 padding = new RectOffset(4, 4, 2, 2),
                 border = new RectOffset(8, 8, 8, 8),
@@ -1114,11 +1537,11 @@ namespace CCMediaPipe
             };
             monitorSubHeaderStyle = new GUIStyle(monitorHeaderStyle)
             {
-                fontSize = 12,
+                fontSize = 14,
             };
             monitorTinyStyle = new GUIStyle(monitorLabelStyle)
             {
-                fontSize = 10,
+                fontSize = 11,
                 normal = { textColor = new Color(0.56f, 0.61f, 0.67f, 1f) },
             };
             monitorRowStyle = new GUIStyle
@@ -1141,7 +1564,89 @@ namespace CCMediaPipe
                 border = new RectOffset(9, 9, 9, 9),
                 normal = { textColor = UiText, background = chipBg },
             };
+            monitorLiveChipStyle = new GUIStyle(monitorChipStyle)
+            {
+                normal = { textColor = UiGood, background = chipBg },
+            };
+            monitorPausedChipStyle = new GUIStyle(monitorChipStyle)
+            {
+                normal = { textColor = UiTextDim, background = chipBg },
+            };
+            BuildMonitorScrollSkin();
             monitorStylesReady = true;
+        }
+
+        // IMGUI's scroller resolves its thumb and arrow buttons by name from the
+        // active skin, so the slim scrollbar lives in a cloned skin that is only
+        // swapped in around the settings scroll views.
+        private void BuildMonitorScrollSkin()
+        {
+            if (monitorScrollSkin != null) Destroy(monitorScrollSkin);
+            monitorScrollSkin = Instantiate(GUI.skin);
+            monitorScrollSkin.hideFlags = HideFlags.HideAndDontSave;
+
+            Texture2D trackBg = RoundedRect(12, 4, new Color(1f, 1f, 1f, 0.05f));
+            Texture2D thumbBg = RoundedRect(12, 4, new Color(UiAccent.r, UiAccent.g, UiAccent.b, 0.55f));
+            Texture2D thumbHoverBg = RoundedRect(12, 4, UiAccentHover);
+
+            var track = new GUIStyle(monitorScrollSkin.verticalScrollbar)
+            {
+                name = monitorScrollSkin.verticalScrollbar.name,
+                fixedWidth = 8f,
+                border = new RectOffset(4, 4, 4, 4),
+                padding = new RectOffset(1, 1, 1, 1),
+                margin = new RectOffset(4, 0, 0, 0),
+                overflow = new RectOffset(0, 0, 0, 0),
+            };
+            track.normal.background = trackBg;
+            track.hover.background = trackBg;
+            track.active.background = trackBg;
+            track.focused.background = trackBg;
+            monitorScrollSkin.verticalScrollbar = track;
+
+            var thumb = new GUIStyle(monitorScrollSkin.verticalScrollbarThumb)
+            {
+                name = monitorScrollSkin.verticalScrollbarThumb.name,
+                fixedWidth = 6f,
+                fixedHeight = 0f,
+                border = new RectOffset(4, 4, 4, 4),
+                padding = new RectOffset(0, 0, 8, 8),
+                margin = new RectOffset(0, 0, 0, 0),
+                overflow = new RectOffset(0, 0, 0, 0),
+            };
+            thumb.normal.background = thumbBg;
+            thumb.hover.background = thumbHoverBg;
+            thumb.active.background = thumbHoverBg;
+            thumb.focused.background = thumbBg;
+            monitorScrollSkin.verticalScrollbarThumb = thumb;
+
+            var noButton = new GUIStyle
+            {
+                fixedWidth = 0f,
+                fixedHeight = 0f,
+                margin = new RectOffset(0, 0, 0, 0),
+                padding = new RectOffset(0, 0, 0, 0),
+            };
+            monitorScrollSkin.verticalScrollbarUpButton =
+                new GUIStyle(noButton) { name = monitorScrollSkin.verticalScrollbarUpButton.name };
+            monitorScrollSkin.verticalScrollbarDownButton =
+                new GUIStyle(noButton) { name = monitorScrollSkin.verticalScrollbarDownButton.name };
+        }
+
+        private Vector2 BeginMonitorScroll(Vector2 scroll, float height)
+        {
+            scrollPreviousSkin = GUI.skin;
+            if (monitorScrollSkin != null)
+                GUI.skin = monitorScrollSkin;
+            return GUILayout.BeginScrollView(scroll, false, true, GUILayout.Height(height));
+        }
+
+        private void EndMonitorScroll()
+        {
+            GUILayout.EndScrollView();
+            if (scrollPreviousSkin != null)
+                GUI.skin = scrollPreviousSkin;
+            scrollPreviousSkin = null;
         }
 
         private Texture2D RoundedRect(int size, int radius, Color fill)
@@ -1279,8 +1784,14 @@ namespace CCMediaPipe
         private void OnDestroy()
         {
             UnwireMapperCallbacks();
+#if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
+            if (externalCameraPreviewWindow != null)
+                externalCameraPreviewWindow.ClosedByUser -= HandleExternalCameraPreviewClosedByUser;
+            externalCameraPreviewWindow?.Close();
+#endif
             receiver?.Dispose();
             if (monitorBgTexture != null) Destroy(monitorBgTexture);
+            if (monitorScrollSkin != null) Destroy(monitorScrollSkin);
         }
 
         private void UnwireMapperCallbacks()
@@ -1458,21 +1969,23 @@ namespace CCMediaPipe
         private void SetBlinkLeft(float value)
         {
             if (vrm10Instance == null) return;
-            currentBlinkLeft = NormalizeBlink(value);
+            currentBlinkLeft = NormalizeBlink(value, true);
             ApplyPerEyeBlink();
         }
 
         private void SetBlinkRight(float value)
         {
             if (vrm10Instance == null) return;
-            currentBlinkRight = NormalizeBlink(value);
+            currentBlinkRight = NormalizeBlink(value, false);
             ApplyPerEyeBlink();
         }
 
-        private float NormalizeBlink(float value)
+        private float NormalizeBlink(float value, bool isLeftEye = false)
         {
-            float amplified = Mathf.Clamp01(value * blinkStrength);
-            return amplified >= blinkFullThreshold ? 1f : amplified;
+            // Blink detection now happens in HolisticToVRMBoneMapper, which emits
+            // a clean 0 (open) / 1 (closed) decision per eye based on an actual
+            // closing action. The controller simply forwards that decision.
+            return Mathf.Clamp01(value);
         }
 
         private void ApplyPerEyeBlink()
@@ -1541,6 +2054,40 @@ namespace CCMediaPipe
         {
             if (vrm10Instance == null) return;
             vrm10Instance.Runtime.Expression.SetWeight(key, Mathf.Clamp01(value));
+        }
+
+        private void ResetExpressions()
+        {
+            if (!expressionsWired || vrm10Instance == null) return;
+
+            currentBlinkLeft = 0f;
+            currentBlinkRight = 0f;
+
+            if (hasPerEyeBlink)
+            {
+                vrm10Instance.Runtime.Expression.SetWeight(ExpressionKey.BlinkLeft, 0f);
+                vrm10Instance.Runtime.Expression.SetWeight(ExpressionKey.BlinkRight, 0f);
+            }
+
+            if (hasCombinedBlink)
+                vrm10Instance.Runtime.Expression.SetWeight(ExpressionKey.Blink, 0f);
+
+            ResetExpressionIfPresent(ExpressionKey.Aa);
+            ResetExpressionIfPresent(ExpressionKey.Ih);
+            ResetExpressionIfPresent(ExpressionKey.Ee);
+            ResetExpressionIfPresent(ExpressionKey.Ou);
+            ResetExpressionIfPresent(ExpressionKey.Oh);
+            ResetExpressionIfPresent(ExpressionKey.Happy);
+            ResetExpressionIfPresent(ExpressionKey.Angry);
+            ResetExpressionIfPresent(ExpressionKey.Surprised);
+            ResetExpressionIfPresent(ExpressionKey.Sad);
+            ResetExpressionIfPresent(ExpressionKey.Relaxed);
+        }
+
+        private void ResetExpressionIfPresent(ExpressionKey key)
+        {
+            if (HasExpression(key))
+                vrm10Instance.Runtime.Expression.SetWeight(key, 0f);
         }
     }
 }

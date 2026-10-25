@@ -54,16 +54,56 @@ namespace CCMediaPipe
         public bool useWorldLandmarks = true;        // prefer world over normalized
         public bool invertY = true;                  // flip MediaPipe Y (down) to Unity Y (up)
 
-        // When true the hips, spine chain and legs are left in their rest pose so
-        // the avatar stays upright and does not lean/tilt with the tracked torso.
-        // Arms, neck/head, face and hands continue to track. Arms stay enabled
-        // because hand placement is driven by the arm chain.
+        // When true the hips and legs are left in their rest pose so the avatar
+        // stays grounded. The spine chain (Spine/Chest/UpperChest) still tracks
+        // from the shoulders, so a chest-up webcam crop can drive the upper body.
+        // Arms, neck/head, face and hands continue to track.
         public bool lockLowerBody = true;
 
         // Extra pitch (degrees) added to the Head bone after tracking. Positive
         // values lift the head up; use this to correct models whose mapped head
         // ends up looking too low. Applied to the Head bone only (not the Neck).
         public float headPitchOffset = 0f;
+
+        // Extra backward tilt applied only to the Head bone after tracking.
+        // Positive values pull the head back from a forward-leaning rest pose.
+        public float headPitchBackOffset = 6f;
+
+        // Extra pitch (degrees) applied to the spine/chest chain. Positive values
+        // lean the torso backward; use a small positive value to correct a model
+        // that reads as leaning slightly forward.
+        public float torsoPitchOffset = 0f;
+
+        // ---- Blink detection (action-based, distance-invariant) ----
+        // Each eye keeps its own recent "open" baseline and only reports closed
+        // when smoothed closedness rises clearly above it. This avoids the old
+        // absolute-threshold behavior where jitter from a small/distant face
+        // crossed a low threshold and produced flickering blinks.
+        public float blinkSmoothing = 0.30f;        // 0 = instant, higher = smoother
+        public float blinkBaselineRise = 1.5f;      // baseline recovery rate (per second)
+        public float blinkClosedPeakAttack = 10f;   // how fast the closed peak tracks upward
+        public float blinkClosedPeakRelease = 1.5f; // how fast the closed peak decays toward baseline
+        public float blinkMinRange = 0.04f;         // minimum open/closed contrast to consider a blink
+        public float blinkCloseRatio = 0.55f;       // normalized closedness that counts as a closing action
+        public float blinkOpenRatio = 0.30f;        // hysteresis: normalized closedness to reopen
+        public float blinkConfirmSeconds = 0.03f;   // closing condition must hold this long
+        public float blinkOpenConfirmSeconds = 0.05f;
+
+        // Periodic open-eye calibration. Every blinkCalibrationInterval seconds
+        // the open-eye reference is re-measured from the recent samples, so a
+        // small/far face that reads as half-closed becomes the new "open" level.
+        // The eye only closes when it differs clearly from that reference.
+        public bool blinkPeriodicCalibration = true;
+        public float blinkCalibrationInterval = 2f;
+        private const int BlinkCalibrationMaxSamples = 256;
+        private const float BlinkCalibrationPercentile = 0.3f;
+        private const float BlinkCalibrationMinRange = 0.12f;
+        private const float BlinkCalibrationDefaultRange = 0.3f;
+        private const float BlinkCalibrationMaxRange = 0.6f;
+        // Reopen once closedness falls to this fraction of the deepest closure
+        // reached, capped below the close threshold to keep hysteresis.
+        private const float BlinkReleaseDepth = 0.6f;
+        private const float BlinkReleaseCloseCap = 0.85f;
 
         // How strongly the tracked head nod (pitch about local X) is applied.
         // The raw shoulder->nose pitch is noisy, so it used to be hard-damped to
@@ -74,12 +114,39 @@ namespace CCMediaPipe
         private Animator animator;
         private Dictionary<HumanBodyBones, Quaternion> smoothedRotations;
 
+        private EyeBlinkDetector _leftBlink;
+        private EyeBlinkDetector _rightBlink;
+
         // Rest-pose cache for direction-based aiming (captured lazily on first use,
         // while the model is still in its imported rest/T-pose).
         private Dictionary<HumanBodyBones, Vector3> restChildDirWorld = new Dictionary<HumanBodyBones, Vector3>();
         private Dictionary<HumanBodyBones, Quaternion> restWorldRotation = new Dictionary<HumanBodyBones, Quaternion>();
+        private Dictionary<HumanBodyBones, Vector3> restTwistWorld = new Dictionary<HumanBodyBones, Vector3>();
         private Dictionary<HumanBodyBones, Quaternion> restLocalRotation = new Dictionary<HumanBodyBones, Quaternion>();
         private bool lastLockLowerBody;
+
+        // ---- Neck / head limits (upper-body safety) ----
+        // The head is driven from the face landmarks (nose, ears, eyes, mouth)
+        // and expressed relative to the avatar's chest, then clamped to these
+        // anatomical limits so noisy or leaning poses can never fold the head
+        // down into the torso.
+        public float maxHeadPitchDown = 35f;   // chin toward chest
+        public float maxHeadPitchUp = 40f;     // looking up
+        public float maxHeadYaw = 70f;         // turning left/right
+        public float maxHeadRoll = 35f;        // tilting toward a shoulder
+        // Share of the head rotation carried by the Neck bone (rest goes to Head).
+        public float neckRotationShare = 0.35f;
+        // The nose tip sits below and in front of the ears, so a neutral face
+        // reads as pitched down by roughly this many degrees.
+        public float headNeutralPitch = 15f;
+
+        private const float HeadOutlierAngle = 60f;
+        private const int HeadOutlierMaxRejects = 5;
+        private bool hasHeadRest;
+        private Quaternion restHeadParentWorld = Quaternion.identity;
+        private Quaternion lastHeadRelative = Quaternion.identity;
+        private bool hasLastHeadRelative;
+        private int headOutlierRejects;
 
         // Rest-pose palm frame for each hand, captured while the model is still
         // in its imported pose. We store the rotation from the hand bone's local
@@ -91,6 +158,8 @@ namespace CCMediaPipe
         private struct PalmRest
         {
             public Quaternion handToPalm; // hand-bone local space -> palm frame
+            public Vector3 sideWorld;     // index knuckle -> little knuckle
+            public Vector3 normalWorld;   // palm normal
             public bool valid;
         }
         private PalmRest _leftPalmRest;
@@ -102,6 +171,8 @@ namespace CCMediaPipe
         // follows the wrist: direction_model = livePalm * (inverse(mpPalm) * dir).
         private Quaternion _currentHandMpToModel = Quaternion.identity;
         private bool _currentHandMappingValid;
+        private Vector3 _currentHandModelSide;
+        private Vector3 _currentHandModelNormal;
 
         // Reference directions in T-pose (model local space at import)
         private static readonly Vector3 RefUp = Vector3.up;
@@ -209,10 +280,13 @@ namespace CCMediaPipe
         }
 
         smoothedRotations.Clear();
+        hasLastHeadRelative = false;
+        headOutlierRejects = 0;
         if (recaptureRestPose)
         {
             restChildDirWorld.Clear();
             restWorldRotation.Clear();
+            restTwistWorld.Clear();
             restLocalRotation.Clear();
             CaptureRestPose();
         }
@@ -263,28 +337,68 @@ namespace CCMediaPipe
             restWorldRotation[bone] = t.rotation;
         }
 
-        var lowerBodyBones = new[]
-        {
-            HumanBodyBones.Hips,
-            HumanBodyBones.Spine,
-            HumanBodyBones.Chest,
-            HumanBodyBones.UpperChest,
-            HumanBodyBones.LeftUpperLeg,
-            HumanBodyBones.LeftLowerLeg,
-            HumanBodyBones.LeftFoot,
-            HumanBodyBones.RightUpperLeg,
-            HumanBodyBones.RightLowerLeg,
-            HumanBodyBones.RightFoot,
-        };
-        foreach (var bone in lowerBodyBones)
+        foreach (var bone in ResetPoseBones)
         {
             var t = GetBoneTransform(bone);
             if (t == null) continue;
             restLocalRotation[bone] = t.localRotation;
         }
-        CaptureFingerRestPose();
+        CaptureHeadRest();
         CapturePalmRest();
+        CaptureFingerRestPose();
     }
+
+    private static readonly HumanBodyBones[] ResetPoseBones =
+    {
+        HumanBodyBones.Hips,
+        HumanBodyBones.Spine,
+        HumanBodyBones.Chest,
+        HumanBodyBones.UpperChest,
+        HumanBodyBones.Neck,
+        HumanBodyBones.Head,
+        HumanBodyBones.LeftUpperArm,
+        HumanBodyBones.LeftLowerArm,
+        HumanBodyBones.LeftHand,
+        HumanBodyBones.RightUpperArm,
+        HumanBodyBones.RightLowerArm,
+        HumanBodyBones.RightHand,
+        HumanBodyBones.LeftUpperLeg,
+        HumanBodyBones.LeftLowerLeg,
+        HumanBodyBones.LeftFoot,
+        HumanBodyBones.RightUpperLeg,
+        HumanBodyBones.RightLowerLeg,
+        HumanBodyBones.RightFoot,
+        HumanBodyBones.LeftThumbProximal,
+        HumanBodyBones.LeftThumbIntermediate,
+        HumanBodyBones.LeftThumbDistal,
+        HumanBodyBones.LeftIndexProximal,
+        HumanBodyBones.LeftIndexIntermediate,
+        HumanBodyBones.LeftIndexDistal,
+        HumanBodyBones.LeftMiddleProximal,
+        HumanBodyBones.LeftMiddleIntermediate,
+        HumanBodyBones.LeftMiddleDistal,
+        HumanBodyBones.LeftRingProximal,
+        HumanBodyBones.LeftRingIntermediate,
+        HumanBodyBones.LeftRingDistal,
+        HumanBodyBones.LeftLittleProximal,
+        HumanBodyBones.LeftLittleIntermediate,
+        HumanBodyBones.LeftLittleDistal,
+        HumanBodyBones.RightThumbProximal,
+        HumanBodyBones.RightThumbIntermediate,
+        HumanBodyBones.RightThumbDistal,
+        HumanBodyBones.RightIndexProximal,
+        HumanBodyBones.RightIndexIntermediate,
+        HumanBodyBones.RightIndexDistal,
+        HumanBodyBones.RightMiddleProximal,
+        HumanBodyBones.RightMiddleIntermediate,
+        HumanBodyBones.RightMiddleDistal,
+        HumanBodyBones.RightRingProximal,
+        HumanBodyBones.RightRingIntermediate,
+        HumanBodyBones.RightRingDistal,
+        HumanBodyBones.RightLittleProximal,
+        HumanBodyBones.RightLittleIntermediate,
+        HumanBodyBones.RightLittleDistal,
+    };
 
     // Capture each hand's rest palm frame relative to its hand bone. The palm
     // frame is defined anatomically (forward = toward the middle-finger knuckle,
@@ -312,9 +426,15 @@ namespace CCMediaPipe
         if (!TryBuildPalmRotation(forward, side, out var palmWorld))
             return default;
 
+        Vector3 forwardDir = forward.normalized;
+        Vector3 sideDir = Vector3.ProjectOnPlane(side, forwardDir).normalized;
+        Vector3 normalDir = Vector3.Cross(forwardDir, sideDir).normalized;
+
         return new PalmRest
         {
             handToPalm = Quaternion.Inverse(hand.rotation) * palmWorld,
+            sideWorld = sideDir,
+            normalWorld = normalDir,
             valid = true,
         };
     }
@@ -329,10 +449,13 @@ namespace CCMediaPipe
         rotation = Quaternion.identity;
         if (forward.sqrMagnitude < 1e-10f || side.sqrMagnitude < 1e-10f)
             return false;
-        Vector3 normal = Vector3.Cross(forward, side);
-        if (normal.sqrMagnitude < 1e-10f)
+        Vector3 forwardDir = forward.normalized;
+        Vector3 sideDir = Vector3.ProjectOnPlane(side, forwardDir);
+        if (sideDir.sqrMagnitude < 1e-10f)
             return false;
-        rotation = Quaternion.LookRotation(forward.normalized, normal.normalized);
+        sideDir.Normalize();
+        Vector3 normal = Vector3.Cross(forwardDir, sideDir);
+        rotation = Quaternion.LookRotation(forwardDir, normal);
         return true;
     }
 
@@ -342,37 +465,43 @@ namespace CCMediaPipe
     // back to the bone transform's first child (the fingertip leaf).
     private void CaptureFingerRestPose()
     {
-        var fingers = new (HumanBodyBones proximal, HumanBodyBones intermediate, HumanBodyBones distal)[]
+        var fingers = new (bool isLeft, HumanBodyBones proximal, HumanBodyBones intermediate, HumanBodyBones distal)[]
         {
-            (HumanBodyBones.LeftThumbProximal,  HumanBodyBones.LeftThumbIntermediate,  HumanBodyBones.LeftThumbDistal),
-            (HumanBodyBones.LeftIndexProximal,  HumanBodyBones.LeftIndexIntermediate,  HumanBodyBones.LeftIndexDistal),
-            (HumanBodyBones.LeftMiddleProximal, HumanBodyBones.LeftMiddleIntermediate, HumanBodyBones.LeftMiddleDistal),
-            (HumanBodyBones.LeftRingProximal,   HumanBodyBones.LeftRingIntermediate,   HumanBodyBones.LeftRingDistal),
-            (HumanBodyBones.LeftLittleProximal, HumanBodyBones.LeftLittleIntermediate, HumanBodyBones.LeftLittleDistal),
-            (HumanBodyBones.RightThumbProximal,  HumanBodyBones.RightThumbIntermediate,  HumanBodyBones.RightThumbDistal),
-            (HumanBodyBones.RightIndexProximal,  HumanBodyBones.RightIndexIntermediate,  HumanBodyBones.RightIndexDistal),
-            (HumanBodyBones.RightMiddleProximal, HumanBodyBones.RightMiddleIntermediate, HumanBodyBones.RightMiddleDistal),
-            (HumanBodyBones.RightRingProximal,   HumanBodyBones.RightRingIntermediate,   HumanBodyBones.RightRingDistal),
-            (HumanBodyBones.RightLittleProximal, HumanBodyBones.RightLittleIntermediate, HumanBodyBones.RightLittleDistal),
+            (true,  HumanBodyBones.LeftThumbProximal,  HumanBodyBones.LeftThumbIntermediate,  HumanBodyBones.LeftThumbDistal),
+            (true,  HumanBodyBones.LeftIndexProximal,  HumanBodyBones.LeftIndexIntermediate,  HumanBodyBones.LeftIndexDistal),
+            (true,  HumanBodyBones.LeftMiddleProximal, HumanBodyBones.LeftMiddleIntermediate, HumanBodyBones.LeftMiddleDistal),
+            (true,  HumanBodyBones.LeftRingProximal,   HumanBodyBones.LeftRingIntermediate,   HumanBodyBones.LeftRingDistal),
+            (true,  HumanBodyBones.LeftLittleProximal, HumanBodyBones.LeftLittleIntermediate, HumanBodyBones.LeftLittleDistal),
+            (false, HumanBodyBones.RightThumbProximal,  HumanBodyBones.RightThumbIntermediate,  HumanBodyBones.RightThumbDistal),
+            (false, HumanBodyBones.RightIndexProximal,  HumanBodyBones.RightIndexIntermediate,  HumanBodyBones.RightIndexDistal),
+            (false, HumanBodyBones.RightMiddleProximal, HumanBodyBones.RightMiddleIntermediate, HumanBodyBones.RightMiddleDistal),
+            (false, HumanBodyBones.RightRingProximal,   HumanBodyBones.RightRingIntermediate,   HumanBodyBones.RightRingDistal),
+            (false, HumanBodyBones.RightLittleProximal, HumanBodyBones.RightLittleIntermediate, HumanBodyBones.RightLittleDistal),
         };
 
-        foreach (var (proximal, intermediate, distal) in fingers)
+        foreach (var (isLeft, proximal, intermediate, distal) in fingers)
         {
+            var palmRest = isLeft ? _leftPalmRest : _rightPalmRest;
+            bool isThumb = proximal == HumanBodyBones.LeftThumbProximal || proximal == HumanBodyBones.RightThumbProximal;
+            Vector3 restTwist = palmRest.valid
+                ? (isThumb ? palmRest.normalWorld : palmRest.sideWorld)
+                : Vector3.zero;
+
             // Proximal and intermediate have a real next bone, so their rest
             // pointing direction is bone -> childBone.
-            CaptureFingerSegment(proximal, intermediate, (HumanBodyBones)(-1));
-            CaptureFingerSegment(intermediate, distal, (HumanBodyBones)(-1));
+            CaptureFingerSegment(proximal, intermediate, (HumanBodyBones)(-1), restTwist);
+            CaptureFingerSegment(intermediate, distal, (HumanBodyBones)(-1), restTwist);
             // The distal bone ends the humanoid chain (no fingertip bone on most
             // VRM/VRoid rigs). Pass the intermediate as a parent fallback so its
             // rest direction is the chain continuation (parent -> distal), which
             // for a straight rest finger equals the way the distal points. This
             // avoids the old guess (t.rotation * forward) that bent the top
             // knuckle even when the real finger was straight.
-            CaptureFingerSegment(distal, (HumanBodyBones)(-1), intermediate);
+            CaptureFingerSegment(distal, (HumanBodyBones)(-1), intermediate, restTwist);
         }
     }
 
-    private void CaptureFingerSegment(HumanBodyBones bone, HumanBodyBones childBone, HumanBodyBones parentFallback)
+    private void CaptureFingerSegment(HumanBodyBones bone, HumanBodyBones childBone, HumanBodyBones parentFallback, Vector3 twistWorld)
     {
         var t = GetBoneTransform(bone);
         if (t == null) return;
@@ -403,6 +532,13 @@ namespace CCMediaPipe
 
         restChildDirWorld[bone] = restDir.normalized;
         restWorldRotation[bone] = t.rotation;
+
+        if (twistWorld.sqrMagnitude > 1e-8f)
+        {
+            Vector3 twist = Vector3.ProjectOnPlane(twistWorld, restDir.normalized);
+            if (twist.sqrMagnitude > 1e-8f)
+                restTwistWorld[bone] = twist.normalized;
+        }
     }
 
     public void ResetLowerBodyPose()
@@ -422,6 +558,23 @@ namespace CCMediaPipe
         };
 
         foreach (var bone in bones)
+        {
+            Quaternion rest;
+            if (!restLocalRotation.TryGetValue(bone, out rest))
+                continue;
+            var t = GetBoneTransform(bone);
+            if (t == null) continue;
+
+            t.localRotation = rest;
+            smoothedRotations[bone] = rest;
+        }
+    }
+
+    public void ResetPose()
+    {
+        hasLastHeadRelative = false;
+        headOutlierRejects = 0;
+        foreach (var bone in ResetPoseBones)
         {
             Quaternion rest;
             if (!restLocalRotation.TryGetValue(bone, out rest))
@@ -471,8 +624,10 @@ namespace CCMediaPipe
             }
 
             // ---- Spine chain ----
-            if (!lockLowerBody)
-                ApplySpineChain(lm);
+            // Drive Spine/Chest/UpperChest from the shoulder landmarks even when
+            // the hips/legs are locked. A chest-up webcam crop cannot see the
+            // hips, but the shoulders are still enough to aim the upper torso.
+            ApplySpineChain(lm, frame.HasPoseWorld);
 
             // ---- Neck & Head ----
             ApplyNeckHead(lm);
@@ -497,53 +652,26 @@ namespace CCMediaPipe
             var f = frame.faceLandmarks;
             if (f == null) return;
 
-            // Per-eye blink, evaluated independently so a single-eye wink works
-            // (closing one eye must not pull the other shut).
-            float avatarLeftBlink, avatarRightBlink;
-
-            if (frame.HasFaceBlendshapes)
-            {
-                // Preferred path: MediaPipe's ARKit-style face blendshapes expose
-                // dedicated eyeBlinkLeft / eyeBlinkRight scores. These genuinely
-                // separate the two eyes, unlike the near-symmetric face mesh that
-                // the geometric EAR below reads from. The scores are anatomical
-                // (relative to the tracked subject): eyeBlinkLeft is the subject's
-                // own left eye. For a selfie-mirrored view the avatar should copy
-                // the user like a mirror, so swap sides when mirrorX is set. If
-                // the eyes ever feel reversed, flip the mirrorX toggle.
-                float subjectLeftBlink = frame.GetBlendshape("eyeBlinkLeft");
-                float subjectRightBlink = frame.GetBlendshape("eyeBlinkRight");
-
-                avatarLeftBlink = mirrorX ? subjectRightBlink : subjectLeftBlink;
-                avatarRightBlink = mirrorX ? subjectLeftBlink : subjectRightBlink;
-            }
-            else
-            {
-                // Fallback (e.g. the UDP/Python path, which sends no blendshapes):
-                // estimate blink from the eye aspect ratio. The 159/145 + 33/133
-                // group is the image's left eye; 386/374 + 362/263 is the image's
-                // right eye.
-                float imageLeftEAR = EyeAspectRatio(f, 159, 145, 33, 133);
-                float imageRightEAR = EyeAspectRatio(f, 386, 374, 362, 263);
-
-                // EAR < ~0.2 means an eye is closed; map to a 0-1 blink value.
-                float imageLeftBlink = Mathf.Clamp01((0.3f - imageLeftEAR) / 0.2f);
-                float imageRightBlink = Mathf.Clamp01((0.3f - imageRightEAR) / 0.2f);
-
-                // Map image-space eyes to the avatar's own left/right. When the X
-                // axis is mirrored (selfie-style), the image's left eye drives the
-                // avatar's right expression, and vice versa.
-                avatarLeftBlink = mirrorX ? imageRightBlink : imageLeftBlink;
-                avatarRightBlink = mirrorX ? imageLeftBlink : imageRightBlink;
-            }
+            // Per-eye blink detection, evaluated independently so a single-eye
+            // wink works (closing one eye must not pull the other shut). Instead
+            // of thresholding an absolute blendshape/EAR score (which drifts with
+            // camera distance and jitter), each eye keeps a self-calibrating
+            // "open" baseline. An eye is only reported closed when its smoothed
+            // closedness rises clearly above its own recent open baseline, i.e.
+            // an actual closing action, and it reopens through hysteresis once
+            // the value falls back toward that baseline. No closing motion means
+            // the eye stays open regardless of whether the subject is near or far.
+            float avatarLeftBlink = DetectBlink(
+                ref _leftBlink, RawEyeClosedness(frame, f, leftEye: true), Time.deltaTime);
+            float avatarRightBlink = DetectBlink(
+                ref _rightBlink, RawEyeClosedness(frame, f, leftEye: false), Time.deltaTime);
 
             // Per-eye callbacks let a single eye close independently.
             OnBlinkLeftUpdated?.Invoke(avatarLeftBlink);
             OnBlinkRightUpdated?.Invoke(avatarRightBlink);
 
             // Combined channel kept for callers wired only to the single Blink
-            // expression: take the stronger eye so a deliberate wink still reads
-            // instead of being halved by the open eye.
+            // expression: close when either eye reports a blink.
             OnBlinkUpdated?.Invoke(Mathf.Max(avatarLeftBlink, avatarRightBlink));
 
             // Mouth open: vertical lip gap (13 upper, 14 lower inner lips)
@@ -650,6 +778,205 @@ namespace CCMediaPipe
             float v = Vector3.Distance(f[top].AsVector3(), f[bottom].AsVector3());
             float h = Vector3.Distance(f[left].AsVector3(), f[right].AsVector3());
             return h > 0.0001f ? v / h : 0f;
+        }
+
+        private float RawEyeClosedness(HolisticFrame frame, Landmark[] f, bool leftEye)
+        {
+            if (frame.HasFaceBlendshapes)
+            {
+                // MediaPipe's ARKit-style scores are anatomical (subject's own
+                // left/right). Mirror them onto the avatar when mirrorX is set.
+                float subjectLeft = frame.GetBlendshape("eyeBlinkLeft");
+                float subjectRight = frame.GetBlendshape("eyeBlinkRight");
+                return leftEye == !mirrorX ? subjectLeft : subjectRight;
+            }
+
+            // Geometric fallback (UDP/Python path sends no blendshapes). The
+            // 159/145/33/133 group is the image's left eye; 386/374/362/263 is
+            // the image's right eye.
+            float imageLeft = BlinkFromEAR(f, 159, 145, 33, 133);
+            float imageRight = BlinkFromEAR(f, 386, 374, 362, 263);
+            return leftEye == mirrorX ? imageRight : imageLeft;
+        }
+
+        private static float BlinkFromEAR(Landmark[] f, int top, int bottom, int left, int right)
+        {
+            float ear = EyeAspectRatio(f, top, bottom, left, right);
+            // Open eyes sit near EAR ~0.3; closed eyes fall toward ~0.1 or lower.
+            return Mathf.Clamp01((0.3f - ear) / 0.2f);
+        }
+
+        private struct EyeBlinkDetector
+        {
+            public float smoothed;
+            public float baseline;
+            public float closedPeak;
+            public bool baselineInitialized;
+            public bool closed;
+            public float hold;
+            public List<float> samples;
+            public float calibrationTimer;
+            public float reference;
+            public float contrast;
+            public float closedMax;
+            public bool referenceInitialized;
+        }
+
+        private float DetectBlink(ref EyeBlinkDetector eye, float rawClosedness, float dt)
+        {
+            dt = Mathf.Clamp(dt, 0f, 0.1f);
+
+            // Low-pass the noisy blendshape/EAR closedness signal. In calibrated
+            // mode the opening direction is smoothed less so the eye reopens
+            // without trailing behind the actual eyelid.
+            float retain = Mathf.Clamp01(blinkSmoothing);
+            if (blinkPeriodicCalibration && rawClosedness < eye.smoothed)
+                retain *= 0.5f;
+            eye.smoothed = Mathf.Lerp(eye.smoothed, rawClosedness, 1f - retain);
+
+            float normalized = blinkPeriodicCalibration
+                ? CalibratedClosedness(ref eye, dt)
+                : AdaptiveClosedness(ref eye, dt);
+
+            if (!eye.closed)
+            {
+                if (normalized >= blinkCloseRatio)
+                    eye.hold += dt;
+                else
+                    eye.hold = 0f;
+
+                if (eye.hold >= blinkConfirmSeconds)
+                {
+                    eye.closed = true;
+                    eye.hold = 0f;
+                    eye.closedMax = eye.smoothed;
+                }
+            }
+            else
+            {
+                eye.closedMax = Mathf.Max(eye.closedMax, eye.smoothed);
+                float openThreshold = blinkOpenRatio;
+                if (blinkPeriodicCalibration)
+                {
+                    // A deep closure reads far above the close threshold, so
+                    // waiting for it to fall back to blinkOpenRatio delays the
+                    // reopen. Release relative to the depth actually reached.
+                    float range = Mathf.Max(eye.contrast, BlinkCalibrationMinRange);
+                    float depth = (eye.closedMax - eye.reference) / range;
+                    float release = Mathf.Min(depth * BlinkReleaseDepth, blinkCloseRatio * BlinkReleaseCloseCap);
+                    openThreshold = Mathf.Max(openThreshold, release);
+                }
+
+                if (normalized <= openThreshold)
+                    eye.hold += dt;
+                else
+                    eye.hold = 0f;
+
+                if (eye.hold >= blinkOpenConfirmSeconds)
+                {
+                    eye.closed = false;
+                    eye.hold = 0f;
+                }
+            }
+
+            return eye.closed ? 1f : 0f;
+        }
+
+        // Periodic calibration: collect the smoothed closedness for
+        // blinkCalibrationInterval seconds, then take a low percentile of that
+        // window as the open-eye reference (blinks are short, so most samples
+        // are open). The reference keeps updating even while the eye is
+        // reported closed, so a reference that went stale when the subject
+        // moved away corrects itself on the next check instead of locking the
+        // eye shut.
+        //
+        // Closedness is measured against the user's own blink depth (contrast)
+        // rather than assuming a closed eye reaches 1.0: MediaPipe often only
+        // reports ~0.4-0.7 for a closed eye, less when far away. The contrast
+        // is learned from the deepest closure seen in each window and starts at
+        // a moderate default so blinks register before any learning happens.
+        // Returns 0 at the open reference and 1 at a typical full blink.
+        private float CalibratedClosedness(ref EyeBlinkDetector eye, float dt)
+        {
+            if (eye.samples == null)
+                eye.samples = new List<float>(64);
+
+            if (!eye.referenceInitialized)
+            {
+                eye.reference = eye.smoothed;
+                eye.contrast = BlinkCalibrationDefaultRange;
+                eye.referenceInitialized = true;
+                eye.calibrationTimer = 0f;
+                eye.samples.Clear();
+            }
+
+            if (eye.samples.Count < BlinkCalibrationMaxSamples)
+                eye.samples.Add(eye.smoothed);
+            eye.calibrationTimer += dt;
+
+            if (eye.calibrationTimer >= Mathf.Max(0.25f, blinkCalibrationInterval) && eye.samples.Count > 0)
+            {
+                eye.samples.Sort();
+                int index = Mathf.Clamp(
+                    Mathf.FloorToInt((eye.samples.Count - 1) * BlinkCalibrationPercentile),
+                    0, eye.samples.Count - 1);
+                eye.reference = eye.samples[index];
+
+                float observedDepth = eye.samples[eye.samples.Count - 1] - eye.reference;
+                if (observedDepth >= BlinkCalibrationMinRange)
+                {
+                    eye.contrast = Mathf.Clamp(
+                        Mathf.Lerp(eye.contrast, observedDepth, 0.5f),
+                        BlinkCalibrationMinRange, BlinkCalibrationMaxRange);
+                }
+
+                eye.samples.Clear();
+                eye.calibrationTimer = 0f;
+            }
+
+            float range = Mathf.Max(eye.contrast, BlinkCalibrationMinRange);
+            return Mathf.Clamp01((eye.smoothed - eye.reference) / range);
+        }
+
+        // Original continuous baseline / closed-peak tracking.
+        private float AdaptiveClosedness(ref EyeBlinkDetector eye, float dt)
+        {
+            if (!eye.baselineInitialized)
+            {
+                eye.baseline = eye.smoothed;
+                eye.closedPeak = eye.smoothed;
+                eye.baselineInitialized = true;
+            }
+            else if (!eye.closed)
+            {
+                // Open baseline: track the recent most-open level. New lows are
+                // accepted instantly; otherwise it recovers upward slowly, so a
+                // long squint does not immediately re-baseline into "open".
+                if (eye.smoothed < eye.baseline)
+                    eye.baseline = eye.smoothed;
+                else
+                    eye.baseline = Mathf.Min(eye.baseline + blinkBaselineRise * dt, eye.smoothed);
+
+                // Closed peak: fast attack toward new highs, slow release back
+                // toward the open baseline. Normalizing by this recent contrast
+                // keeps detection stable when the subject is far away.
+                float attack = Mathf.Min(1f, blinkClosedPeakAttack * dt);
+                float release = Mathf.Min(1f, blinkClosedPeakRelease * dt);
+                if (eye.smoothed > eye.closedPeak)
+                    eye.closedPeak += (eye.smoothed - eye.closedPeak) * attack;
+                else
+                    eye.closedPeak += (eye.baseline - eye.closedPeak) * release;
+                eye.closedPeak = Mathf.Max(eye.closedPeak, eye.baseline);
+            }
+            // While closed, baseline and closedPeak are frozen at their pre-blink values.
+
+            // Self-normalized closedness: 0 = at the open baseline, 1 = at the
+            // recent closed peak. Contrast below blinkMinRange is treated as open
+            // so jitter from a small/distant face cannot fake a blink.
+            float range = eye.closedPeak - eye.baseline;
+            return range > blinkMinRange
+                ? Mathf.Clamp01((eye.smoothed - eye.baseline) / range)
+                : 0f;
         }
 
         private static float Average(float a, float b)
@@ -852,7 +1179,7 @@ namespace CCMediaPipe
             t.localRotation = smoothedRotations[bone];
         }
 
-        private void ApplySpineChain(Landmark[] lm)
+        private void ApplySpineChain(Landmark[] lm, bool hasWorldLandmarks)
         {
             // Spine chain: Hips 锟?Spine 锟?Chest 锟?UpperChest
             // Landmarks: hip midpoint (23+24) 锟?shoulder midpoint (11+12)
@@ -860,11 +1187,32 @@ namespace CCMediaPipe
                            lm[PoseLandmark.RightHip].visibility > minVisibility;
             bool hasShoulders = lm[PoseLandmark.LeftShoulder].visibility > minVisibility &&
                                 lm[PoseLandmark.RightShoulder].visibility > minVisibility;
-            if (!hasHips || !hasShoulders) return;
+            if (!hasShoulders) return; // 至少需要肩膀才能追蹤上半身
 
-            Vector3 hipMid = Mid(lm[PoseLandmark.LeftHip], lm[PoseLandmark.RightHip]);
             Vector3 shMid = Mid(lm[PoseLandmark.LeftShoulder], lm[PoseLandmark.RightShoulder]);
-            Vector3 spineDir = ConvertDirection(shMid - hipMid).normalized;
+            Vector3 hipMid;
+            Vector3 spineDir;
+
+            if (hasHips)
+            {
+                // 完整身體追蹤:使用實際的髖部位置
+                hipMid = Mid(lm[PoseLandmark.LeftHip], lm[PoseLandmark.RightHip]);
+                spineDir = ConvertDirection(shMid - hipMid).normalized;
+            }
+            else if (hasWorldLandmarks)
+            {
+                // World pose landmarks are centered on the hip midpoint, so the
+                // shoulder midpoint itself is the hip -> shoulder vector. Using
+                // it keeps chest pitch/lean tracking even when the waist is not
+                // visible to the camera.
+                spineDir = ConvertDirection(shMid).normalized;
+            }
+            else
+            {
+                // 只有上半身:估算髖部位置(肩膀下方約0.5單位)
+                hipMid = shMid - ConvertDirection(Vector3.up) * 0.5f;
+                spineDir = ConvertDirection(shMid - hipMid).normalized;
+            }
 
             if (spineDir.sqrMagnitude < 0.0001f) return;
 
@@ -879,61 +1227,135 @@ namespace CCMediaPipe
                    : spineDir;
                 Quaternion targetLocal = Quaternion.FromToRotation(Vector3.up, localTargetDir);
                 // Remove twist to stop spinning (Y rotation around spine axis)
-                Vector3 euler = targetLocal.eulerAngles; euler.y = 0; targetLocal = Quaternion.Euler(euler);
-
-                if (!smoothedRotations.ContainsKey(bone))
-                    smoothedRotations[bone] = targetLocal;
-                else if (Quaternion.Angle(smoothedRotations[bone], targetLocal) >= 0.3f)
-                    smoothedRotations[bone] = Quaternion.Slerp(smoothedRotations[bone], targetLocal, 1f - bodySmoothing);
-                Quaternion finalLocal = smoothedRotations[bone];
-                // Lift/lower the head to correct a model whose mapped head sits
-                // too low. Applied after smoothing so it is a stable bias, not
-                // something the EMA chases. Negative pitch about local X raises
-                // the gaze for typical VRM head bones.
-                if (bone == HumanBodyBones.Head && Mathf.Abs(headPitchOffset) > 0.0001f)
-                    finalLocal = finalLocal * Quaternion.Euler(-headPitchOffset, 0f, 0f);
-                t.localRotation = finalLocal;
-            }
-        }
-
-        private void ApplyNeckHead(Landmark[] lm)
-        {
-            // Neck: shoulder midpoint 锟?head (nose)
-            // Head: follow neck + face orientation
-            bool hasShoulders = lm[PoseLandmark.LeftShoulder].visibility > minVisibility &&
-                                lm[PoseLandmark.RightShoulder].visibility > minVisibility;
-            bool hasNose = lm[PoseLandmark.Nose].visibility > minVisibility;
-            if (!hasShoulders || !hasNose) return;
-
-            Vector3 shMid = Mid(lm[PoseLandmark.LeftShoulder], lm[PoseLandmark.RightShoulder]);
-            Vector3 nose = lm[PoseLandmark.Nose].AsVector3();
-            Vector3 neckDir = ConvertDirection(nose - shMid).normalized;
-
-            if (neckDir.sqrMagnitude < 0.0001f) return;
-
-            foreach (var bone in new[] { HumanBodyBones.Neck, HumanBodyBones.Head })
-           {
-               var t = GetBoneTransform(bone);
-               if (t == null) continue;
-
-               Vector3 localTargetDir = t.parent != null
-                   ? Quaternion.Inverse(t.parent.rotation) * neckDir
-                    : neckDir;
-                Quaternion targetLocal = Quaternion.FromToRotation(Vector3.up, localTargetDir);
-                // Remove twist to stop spinning (Y rotation around neck/head axis)
-                // Keep pitch (X = nod) and drop yaw twist (Y). headPitchScale
-                // controls how much of the tracked nod is applied.
                 Vector3 euler = targetLocal.eulerAngles;
-                if (euler.x > 180f) euler.x -= 360f;
-                euler.x *= headPitchScale;
-                euler.y = 0;
+                euler.x = -torsoPitchOffset; // fixed backward/forward torso bias
+                euler.y = 0; // remove twist around the spine axis
                 targetLocal = Quaternion.Euler(euler);
+
                 if (!smoothedRotations.ContainsKey(bone))
                     smoothedRotations[bone] = targetLocal;
                 else if (Quaternion.Angle(smoothedRotations[bone], targetLocal) >= 0.3f)
                     smoothedRotations[bone] = Quaternion.Slerp(smoothedRotations[bone], targetLocal, 1f - bodySmoothing);
                 t.localRotation = smoothedRotations[bone];
+
             }
+        }
+
+        private void CaptureHeadRest()
+        {
+            hasHeadRest = false;
+            var head = GetBoneTransform(HumanBodyBones.Head);
+            if (head == null) return;
+
+            var neck = GetBoneTransform(HumanBodyBones.Neck);
+            Transform parent = neck != null ? neck.parent : head.parent;
+            restHeadParentWorld = parent != null ? parent.rotation : Quaternion.identity;
+            restWorldRotation[HumanBodyBones.Head] = head.rotation;
+            if (neck != null)
+                restWorldRotation[HumanBodyBones.Neck] = neck.rotation;
+            hasHeadRest = true;
+        }
+
+        // Drive Neck + Head from the face orientation instead of the
+        // shoulder -> nose line. The old line baked in the forward offset of the
+        // nose, pitched the Neck AND the Head by the same world direction, and
+        // had no limits, so leaning toward the camera (common in upper-body
+        // framing) folded the head down into the chest. Here the head pose is
+        // measured relative to the chest, clamped, then split between the bones.
+        private void ApplyNeckHead(Landmark[] lm)
+        {
+            if (!hasHeadRest) return;
+            var head = GetBoneTransform(HumanBodyBones.Head);
+            if (head == null) return;
+            var neck = GetBoneTransform(HumanBodyBones.Neck);
+            if (neck != null && !restWorldRotation.ContainsKey(HumanBodyBones.Neck)) neck = null;
+
+            if (!TryGetUserHeadRotation(lm, out Quaternion userHead)) return;
+
+            Transform parent = neck != null ? neck.parent : head.parent;
+            Quaternion parentWorld = parent != null ? parent.rotation : Quaternion.identity;
+            Quaternion chestDelta = parentWorld * Quaternion.Inverse(restHeadParentWorld);
+
+            Quaternion relative = ClampHeadRotation(Quaternion.Inverse(chestDelta) * userHead);
+
+            if (hasLastHeadRelative &&
+                Quaternion.Angle(lastHeadRelative, relative) > HeadOutlierAngle &&
+                headOutlierRejects < HeadOutlierMaxRejects)
+            {
+                headOutlierRejects++;
+                return;
+            }
+            headOutlierRejects = 0;
+            lastHeadRelative = relative;
+            hasLastHeadRelative = true;
+
+            if (neck != null)
+            {
+                float share = Mathf.Clamp01(neckRotationShare);
+                Quaternion neckRelative = Quaternion.Slerp(Quaternion.identity, relative, share);
+                SetBoneWorldRotation(HumanBodyBones.Neck,
+                    chestDelta * neckRelative * restWorldRotation[HumanBodyBones.Neck], bodySmoothing);
+            }
+
+            SetBoneWorldRotation(HumanBodyBones.Head,
+                chestDelta * relative * restWorldRotation[HumanBodyBones.Head], bodySmoothing);
+        }
+
+        // Build the user's head orientation (forward = out of the face,
+        // up = mouth -> eyes) in the converted model space.
+        private bool TryGetUserHeadRotation(Landmark[] lm, out Quaternion rotation)
+        {
+            rotation = Quaternion.identity;
+            if (lm == null || lm.Length <= PoseLandmark.MouthRight) return false;
+
+            float softVisibility = minVisibility * 0.6f;
+            if (lm[PoseLandmark.Nose].visibility < minVisibility) return false;
+            if (lm[PoseLandmark.LeftEar].visibility < softVisibility ||
+                lm[PoseLandmark.RightEar].visibility < softVisibility) return false;
+
+            Vector3 nose = lm[PoseLandmark.Nose].AsVector3();
+            Vector3 earMid = Mid(lm[PoseLandmark.LeftEar], lm[PoseLandmark.RightEar]);
+            Vector3 forward = ConvertDirection(nose - earMid);
+            if (forward.sqrMagnitude < 1e-8f) return false;
+            forward.Normalize();
+
+            Vector3 up = Vector3.up;
+            bool hasFaceUp = lm[PoseLandmark.LeftEye].visibility >= softVisibility &&
+                             lm[PoseLandmark.RightEye].visibility >= softVisibility &&
+                             lm[PoseLandmark.MouthLeft].visibility >= softVisibility &&
+                             lm[PoseLandmark.MouthRight].visibility >= softVisibility;
+            if (hasFaceUp)
+            {
+                Vector3 eyeMid = Mid(lm[PoseLandmark.LeftEye], lm[PoseLandmark.RightEye]);
+                Vector3 mouthMid = Mid(lm[PoseLandmark.MouthLeft], lm[PoseLandmark.MouthRight]);
+                Vector3 faceUp = ConvertDirection(eyeMid - mouthMid);
+                if (faceUp.sqrMagnitude > 1e-8f && Mathf.Abs(Vector3.Dot(faceUp.normalized, forward)) < 0.85f)
+                    up = faceUp.normalized;
+            }
+
+            if (Mathf.Abs(Vector3.Dot(up, forward)) > 0.95f) return false;
+            rotation = Quaternion.LookRotation(forward, up);
+            return true;
+        }
+
+        // Decompose into yaw / pitch / roll about the avatar's rest frame,
+        // remove the anatomical neutral offset, apply user tuning and clamp.
+        private Quaternion ClampHeadRotation(Quaternion relative)
+        {
+            Vector3 fwd = relative * Vector3.forward;
+            float yaw = Mathf.Atan2(fwd.x, fwd.z) * Mathf.Rad2Deg;
+            float pitch = -Mathf.Asin(Mathf.Clamp(fwd.y, -1f, 1f)) * Mathf.Rad2Deg;
+
+            Quaternion yawPitch = Quaternion.Euler(pitch, yaw, 0f);
+            Vector3 localUp = Quaternion.Inverse(yawPitch) * (relative * Vector3.up);
+            float roll = -Mathf.Atan2(localUp.x, localUp.y) * Mathf.Rad2Deg;
+
+            pitch = (pitch - headNeutralPitch) * headPitchScale - headPitchBackOffset - headPitchOffset;
+
+            pitch = Mathf.Clamp(pitch, -Mathf.Abs(maxHeadPitchUp), Mathf.Abs(maxHeadPitchDown));
+            yaw = Mathf.Clamp(yaw, -Mathf.Abs(maxHeadYaw), Mathf.Abs(maxHeadYaw));
+            roll = Mathf.Clamp(roll, -Mathf.Abs(maxHeadRoll), Mathf.Abs(maxHeadRoll));
+            return Quaternion.Euler(pitch, yaw, roll);
         }
 
         private void ApplyArm(Landmark[] lm, bool isLeft)
@@ -1002,7 +1424,7 @@ namespace CCMediaPipe
         // child lands on <paramref name="modelDir"/>, a direction already
         // expressed in the model's world space (no further coordinate
         // conversion is applied here).
-        private void AimBoneToModelDirection(HumanBodyBones bone, Vector3 modelDir, float smoothing)
+        private void AimBoneToModelDirection(HumanBodyBones bone, Vector3 modelDir, float smoothing, Vector3 modelTwist = default)
         {
             var t = GetBoneTransform(bone);
             if (t == null) return;
@@ -1013,9 +1435,31 @@ namespace CCMediaPipe
             Vector3 targetDir = modelDir.normalized;
             if (targetDir.sqrMagnitude < 1e-6f) return;
 
-            // World-space delta that turns the rest direction onto the target.
-            Quaternion delta = Quaternion.FromToRotation(restChildDirWorld[bone], targetDir);
-            Quaternion targetWorld = delta * restWorldRotation[bone];
+            // Finger joints should hinge rather than roll freely around their long
+            // axis. When a twist reference is available, align both the rest
+            // direction and the twist axis so the bone keeps its natural curl
+            // plane even when the finger is fully closed.
+            Vector3 restTwist = Vector3.zero;
+            bool hasTwist = modelTwist.sqrMagnitude > 1e-8f &&
+                            restTwistWorld.TryGetValue(bone, out restTwist) &&
+                            restTwist.sqrMagnitude > 1e-8f &&
+                            Vector3.Angle(targetDir, modelTwist) > 2f &&
+                            Vector3.Angle(targetDir, modelTwist) < 178f;
+
+            Quaternion targetWorld;
+            if (hasTwist)
+            {
+                Quaternion restFrame = Quaternion.LookRotation(restChildDirWorld[bone], restTwist);
+                Quaternion targetFrame = Quaternion.LookRotation(targetDir, modelTwist.normalized);
+                Quaternion delta = targetFrame * Quaternion.Inverse(restFrame);
+                targetWorld = delta * restWorldRotation[bone];
+            }
+            else
+            {
+                // World-space delta that turns the rest direction onto the target.
+                Quaternion delta = Quaternion.FromToRotation(restChildDirWorld[bone], targetDir);
+                targetWorld = delta * restWorldRotation[bone];
+            }
 
             // Convert desired world rotation into the bone's local space.
             Quaternion targetLocal = t.parent != null
@@ -1103,6 +1547,10 @@ namespace CCMediaPipe
             Vector3 mpSide    = ConvertDirection(hand[HandLandmark.PinkyMCP].AsVector3()  - hand[HandLandmark.IndexMCP].AsVector3());
             if (!TryBuildPalmRotation(mpForward, mpSide, out var mpPalm)) return false;
 
+            Vector3 mpForwardDir = mpForward.normalized;
+            Vector3 mpSideDir = Vector3.ProjectOnPlane(mpSide, mpForwardDir).normalized;
+            Vector3 mpNormal = Vector3.Cross(mpForwardDir, mpSideDir).normalized;
+
             // Correct the wrist first. The arm chain only aims the forearm
             // (elbow -> wrist), leaving the hand bone at its rest roll, which
             // reads as the palm angled outward. Since SetBoneWorldRotation uses
@@ -1119,6 +1567,8 @@ namespace CCMediaPipe
             // hand-bone axes.
             Quaternion livePalm = handBone.rotation * palmRest.handToPalm;
             _currentHandMpToModel = livePalm * Quaternion.Inverse(mpPalm);
+            _currentHandModelSide = (_currentHandMpToModel * mpSideDir).normalized;
+            _currentHandModelNormal = (_currentHandMpToModel * mpNormal).normalized;
             _currentHandMappingValid = true;
 
             return true;
@@ -1162,7 +1612,18 @@ namespace CCMediaPipe
             if (mpDir.sqrMagnitude < 1e-10f) return;
 
             Vector3 modelDir = _currentHandMpToModel * mpDir;
-            AimBoneToModelDirection(bone, modelDir, handSmoothing);
+            Vector3 modelTwist = IsThumbBone(bone) ? _currentHandModelNormal : _currentHandModelSide;
+            AimBoneToModelDirection(bone, modelDir, handSmoothing, modelTwist);
+        }
+
+        private static bool IsThumbBone(HumanBodyBones bone)
+        {
+            return bone == HumanBodyBones.LeftThumbProximal ||
+                   bone == HumanBodyBones.LeftThumbIntermediate ||
+                   bone == HumanBodyBones.LeftThumbDistal ||
+                   bone == HumanBodyBones.RightThumbProximal ||
+                   bone == HumanBodyBones.RightThumbIntermediate ||
+                   bone == HumanBodyBones.RightThumbDistal;
         }
     }
 }

@@ -23,8 +23,25 @@ namespace CCMediaPipe
         public Color leftHandColor = new Color(0.3f, 1f, 0.35f, 1f);
         public Color rightHandColor = new Color(1f, 0.35f, 0.25f, 1f);
 
+        [Header("Model Depth Fit")]
+        [Tooltip("Correct MediaPipe depth by aligning landmarks to the VRM humanoid bones along the camera depth axis.")]
+        public bool fitDepthToModel = true;
+        [Range(0f, 1f)]
+        [Tooltip("0 keeps the raw AI depth, 1 fully matches the VRM bone depth.")]
+        public float depthFitStrength = 1f;
+
         private readonly List<LineRenderer> lines = new List<LineRenderer>();
         private readonly List<Transform> joints = new List<Transform>();
+        private readonly Vector3[] posePoints = new Vector3[HolisticFrame.PoseLandmarkCount];
+        private readonly Vector3[] handPoints = new Vector3[HolisticFrame.HandLandmarkCount];
+        private readonly float[] depthDeltas = new float[HolisticFrame.PoseLandmarkCount];
+        private readonly Transform[] poseBones = new Transform[HolisticFrame.PoseLandmarkCount];
+        private Animator modelAnimator;
+        private Transform headBone;
+        private Transform leftHandBone;
+        private Transform rightHandBone;
+        private Transform leftMiddleProximalBone;
+        private Transform rightMiddleProximalBone;
         private Material xrayMaterial;
         private Transform anchor;
         private Vector3 anchorOffset;
@@ -48,6 +65,57 @@ namespace CCMediaPipe
             { 0, 17 }, { 17, 18 }, { 18, 19 }, { 19, 20 },
             { 5, 9 }, { 9, 13 }, { 13, 17 }
         };
+
+        private static readonly int[] DepthSource =
+        {
+            -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+            PoseLandmark.LeftShoulder, PoseLandmark.RightShoulder,
+            PoseLandmark.LeftElbow, PoseLandmark.RightElbow,
+            PoseLandmark.LeftWrist, PoseLandmark.RightWrist,
+            PoseLandmark.LeftWrist, PoseLandmark.RightWrist,
+            PoseLandmark.LeftWrist, PoseLandmark.RightWrist,
+            PoseLandmark.LeftWrist, PoseLandmark.RightWrist,
+            PoseLandmark.LeftHip, PoseLandmark.RightHip,
+            PoseLandmark.LeftKnee, PoseLandmark.RightKnee,
+            PoseLandmark.LeftAnkle, PoseLandmark.RightAnkle,
+            PoseLandmark.LeftAnkle, PoseLandmark.RightAnkle,
+            PoseLandmark.LeftAnkle, PoseLandmark.RightAnkle
+        };
+
+        public void SetModelAnimator(Animator animator)
+        {
+            if (animator == modelAnimator && (animator == null || headBone != null))
+                return;
+
+            modelAnimator = animator;
+            for (int i = 0; i < poseBones.Length; i++) poseBones[i] = null;
+            headBone = Bone(HumanBodyBones.Head);
+            leftHandBone = Bone(HumanBodyBones.LeftHand);
+            rightHandBone = Bone(HumanBodyBones.RightHand);
+            leftMiddleProximalBone = Bone(HumanBodyBones.LeftMiddleProximal);
+            rightMiddleProximalBone = Bone(HumanBodyBones.RightMiddleProximal);
+
+            poseBones[PoseLandmark.LeftShoulder] = Bone(HumanBodyBones.LeftUpperArm);
+            poseBones[PoseLandmark.RightShoulder] = Bone(HumanBodyBones.RightUpperArm);
+            poseBones[PoseLandmark.LeftElbow] = Bone(HumanBodyBones.LeftLowerArm);
+            poseBones[PoseLandmark.RightElbow] = Bone(HumanBodyBones.RightLowerArm);
+            poseBones[PoseLandmark.LeftWrist] = leftHandBone;
+            poseBones[PoseLandmark.RightWrist] = rightHandBone;
+            poseBones[PoseLandmark.LeftHip] = Bone(HumanBodyBones.LeftUpperLeg);
+            poseBones[PoseLandmark.RightHip] = Bone(HumanBodyBones.RightUpperLeg);
+            poseBones[PoseLandmark.LeftKnee] = Bone(HumanBodyBones.LeftLowerLeg);
+            poseBones[PoseLandmark.RightKnee] = Bone(HumanBodyBones.RightLowerLeg);
+            poseBones[PoseLandmark.LeftAnkle] = Bone(HumanBodyBones.LeftFoot);
+            poseBones[PoseLandmark.RightAnkle] = Bone(HumanBodyBones.RightFoot);
+            poseBones[PoseLandmark.LeftFootIndex] = Bone(HumanBodyBones.LeftToes);
+            poseBones[PoseLandmark.RightFootIndex] = Bone(HumanBodyBones.RightToes);
+        }
+
+        private Transform Bone(HumanBodyBones bone)
+        {
+            return modelAnimator != null && modelAnimator.isHuman
+                ? modelAnimator.GetBoneTransform(bone) : null;
+        }
 
         public void Configure(Transform modelAnchor, Vector3 offset,
             bool mirrorX, bool invertY, bool invertZ, float scale)
@@ -88,24 +156,28 @@ namespace CCMediaPipe
             var left = SelectRenderableHand(frame.BestLeftHand);
             var right = SelectRenderableHand(frame.BestRightHand);
             Vector3 hipOrigin = Vector3.zero;
-            if (pose != null && pose.Length == HolisticFrame.PoseLandmarkCount)
+            bool hasPose = pose != null && pose.Length == HolisticFrame.PoseLandmarkCount;
+            if (hasPose)
+            {
                 hipOrigin = Mid(pose[PoseLandmark.LeftHip], pose[PoseLandmark.RightHip]);
+                BuildPosePoints(pose, hipOrigin);
+            }
 
             int lineIndex = 0;
             int jointIndex = 0;
-            if (showPose && pose != null && pose.Length == HolisticFrame.PoseLandmarkCount)
+            if (showPose && hasPose)
             {
                 for (int i = 0; i < PoseConnections.GetLength(0); i++)
-                    SetLine(lineIndex++, Point(pose[PoseConnections[i, 0]], hipOrigin),
-                        Point(pose[PoseConnections[i, 1]], hipOrigin), poseColor);
+                    SetLine(lineIndex++, posePoints[PoseConnections[i, 0]],
+                        posePoints[PoseConnections[i, 1]], poseColor);
                 for (int i = 0; i < pose.Length; i++)
-                    SetJoint(jointIndex++, Point(pose[i], hipOrigin), poseColor);
+                    SetJoint(jointIndex++, posePoints[i], poseColor);
             }
 
             if (showHands)
             {
-                DrawHand(left, hipOrigin, leftHandColor, ref lineIndex, ref jointIndex);
-                DrawHand(right, hipOrigin, rightHandColor, ref lineIndex, ref jointIndex);
+                DrawHand(left, true, hasPose, hipOrigin, leftHandColor, ref lineIndex, ref jointIndex);
+                DrawHand(right, false, hasPose, hipOrigin, rightHandColor, ref lineIndex, ref jointIndex);
             }
 
             for (; lineIndex < lines.Count; lineIndex++) lines[lineIndex].enabled = false;
@@ -127,23 +199,92 @@ namespace CCMediaPipe
                 ? hand : null;
         }
 
-        private void DrawHand(Landmark[] hand, Vector3 hipOrigin, Color color,
-            ref int lineIndex, ref int jointIndex)
+        private void BuildPosePoints(Landmark[] pose, Vector3 hipOrigin)
+        {
+            for (int i = 0; i < pose.Length; i++)
+                posePoints[i] = Point(pose[i], hipOrigin);
+
+            if (!fitDepthToModel || depthFitStrength <= 0f || modelAnimator == null)
+                return;
+
+            for (int i = 0; i < depthDeltas.Length; i++)
+            {
+                Transform bone = poseBones[i];
+                depthDeltas[i] = bone != null ? bone.position.z - posePoints[i].z : float.NaN;
+            }
+
+            float headDelta = float.NaN;
+            if (headBone != null)
+                headDelta = headBone.position.z -
+                    (posePoints[PoseLandmark.LeftEar].z + posePoints[PoseLandmark.RightEar].z) * 0.5f;
+
+            for (int i = 0; i < posePoints.Length; i++)
+            {
+                float delta = depthDeltas[i];
+                if (float.IsNaN(delta))
+                {
+                    int source = DepthSource[i];
+                    delta = source < 0 ? headDelta : depthDeltas[source];
+                }
+
+                if (!float.IsNaN(delta))
+                    posePoints[i].z += delta * depthFitStrength;
+            }
+        }
+
+        private void DrawHand(Landmark[] hand, bool isLeft, bool hasPose, Vector3 hipOrigin,
+            Color color, ref int lineIndex, ref int jointIndex)
         {
             if (hand == null || hand.Length != HolisticFrame.HandLandmarkCount) return;
+            BuildHandPoints(hand, isLeft, hasPose, hipOrigin);
             for (int i = 0; i < HandConnections.GetLength(0); i++)
-                SetLine(lineIndex++, Point(hand[HandConnections[i, 0]], hipOrigin),
-                    Point(hand[HandConnections[i, 1]], hipOrigin), color);
+                SetLine(lineIndex++, handPoints[HandConnections[i, 0]],
+                    handPoints[HandConnections[i, 1]], color);
             for (int i = 0; i < hand.Length; i++)
-                SetJoint(jointIndex++, Point(hand[i], hipOrigin), color);
+                SetJoint(jointIndex++, handPoints[i], color);
+        }
+
+        private void BuildHandPoints(Landmark[] hand, bool isLeft, bool hasPose, Vector3 hipOrigin)
+        {
+            Transform handBone = isLeft ? leftHandBone : rightHandBone;
+            if (!hasPose && handBone == null)
+            {
+                for (int i = 0; i < hand.Length; i++)
+                    handPoints[i] = Point(hand[i], hipOrigin);
+                return;
+            }
+
+            Vector3 wrist = hasPose
+                ? posePoints[isLeft ? PoseLandmark.LeftWrist : PoseLandmark.RightWrist]
+                : handBone.position;
+            Vector3 handOrigin = hand[HandLandmark.Wrist].AsVector3();
+            float handScale = EstimateHandScale(hand, isLeft);
+            for (int i = 0; i < hand.Length; i++)
+                handPoints[i] = wrist + ConvertAxes(hand[i].AsVector3() - handOrigin) * handScale;
+        }
+
+        private float EstimateHandScale(Landmark[] hand, bool isLeft)
+        {
+            Transform handBone = isLeft ? leftHandBone : rightHandBone;
+            Transform middleBone = isLeft ? leftMiddleProximalBone : rightMiddleProximalBone;
+            float landmarkLength = Vector3.Distance(hand[HandLandmark.Wrist].AsVector3(),
+                hand[HandLandmark.MiddleMCP].AsVector3());
+            if (handBone == null || middleBone == null || landmarkLength <= 1e-5f)
+                return scale;
+
+            float modelLength = Vector3.Distance(handBone.position, middleBone.position);
+            return modelLength > 1e-5f ? modelLength / landmarkLength : scale;
         }
 
         private Vector3 Point(Landmark landmark, Vector3 hipOrigin)
         {
-            Vector3 p = landmark.AsVector3() - hipOrigin;
-            p = new Vector3(mirrorX ? -p.x : p.x, invertY ? -p.y : p.y,
-                invertZ ? -p.z : p.z) * scale;
-            return anchor.position + anchorOffset + p;
+            return anchor.position + anchorOffset + ConvertAxes(landmark.AsVector3() - hipOrigin) * scale;
+        }
+
+        private Vector3 ConvertAxes(Vector3 p)
+        {
+            return new Vector3(mirrorX ? -p.x : p.x, invertY ? -p.y : p.y,
+                invertZ ? -p.z : p.z);
         }
 
         private static Vector3 Mid(Landmark a, Landmark b)
